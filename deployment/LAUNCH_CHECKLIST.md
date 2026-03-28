@@ -1,0 +1,25 @@
+# Launch Checklist
+
+- [ ] `requirements.txt` includes all runtime dependencies, including `requests`
+- [ ] `deployment/render.yaml` start command runs `python init_db.py` before `uvicorn`
+- [ ] `OPENAI_API_KEY` is set
+- [ ] `GENERATION_RUNTIME_PROFILE=production` is set
+- [ ] `ENABLE_LLM_SURFACE_GENERATION_V3=true`
+- [ ] `ENABLE_CONTROL_CHECKS=true`
+- [ ] `ENABLE_REWRITE_V3=true`
+- [ ] `ENABLE_FALLBACK_V21=true`
+- [ ] `DEBUG_RETURN_INTERMEDIATE=false`
+- [ ] `DEMO_DEBUG_TOKEN` is set
+- [ ] `DEMO_ADMIN_TOKEN` is set
+- [ ] `DEMO_RATE_LIMIT_WINDOW_SECONDS` is set
+- [ ] `DEMO_RATE_LIMIT_MAX_REQUESTS` is set
+- [ ] `db/chroma` is present and readable in the deploy environment
+- [ ] `db/session.sqlite3` path is writable
+- [ ] Persistent disk strategy is confirmed if logs/feedback must survive restarts
+- [ ] `/api/health` returns `200`
+- [ ] homepage returns `200`
+- [ ] `/api/config` returns title, description, and examples
+- [ ] normal user mode does not expose full debug details
+- [ ] debug mode works with `?debug=1&token=...`
+- [ ] `/api/feedback` writes feedback successfully
+- [ ] `/admin?token=...` loads recent requests and feedback

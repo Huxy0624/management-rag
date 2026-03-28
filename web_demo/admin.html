@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TraceAnswer Admin</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Admin View</p>
+        <h1>Recent Requests</h1>
+        <p class="subtitle">A lightweight read-only view of recent requests and feedback.</p>
+      </div>
+      <div id="adminStatus" class="badge">Loading...</div>
+    </header>
+
+    <section class="panel">
+      <div class="section-title">Latest 50 Requests</div>
+      <div class="intro-text">Use this page to quickly inspect recent questions, fallback behavior, latency, and user feedback after deployment.</div>
+      <div class="table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Question</th>
+              <th>Success</th>
+              <th>Selected</th>
+              <th>Fallback</th>
+              <th>Latency</th>
+              <th>Session</th>
+              <th>Request</th>
+              <th>Feedback</th>
+              <th>Comment</th>
+            </tr>
+          </thead>
+          <tbody id="adminTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script src="/static/admin.js"></script>
+</body>
+</html>

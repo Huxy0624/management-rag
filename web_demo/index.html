@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TraceAnswer Demo</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Observable RAG Product Demo</p>
+        <h1 id="demoTitle">TraceAnswer</h1>
+        <p id="demoTagline" class="subtitle">一个可观测、可调试、可演示的 RAG 问答系统原型。</p>
+      </div>
+      <div id="healthBadge" class="badge">Loading...</div>
+    </header>
+
+    <section class="intro panel">
+      <div class="section-title">About This Demo</div>
+      <p id="demoDescription" class="intro-text">
+        这是一个可对外分享的 AI 问答体验版，用来展示检索、规划、受控生成和稳定性保护如何协同工作。
+      </p>
+      <p class="intro-note">Try one of the example questions below, or ask your own. This is a live prototype, so answers may still vary across topics.</p>
+    </section>
+
+    <main class="layout">
+      <section class="panel main-panel">
+        <div class="input-card">
+          <label for="questionInput">Ask a management question</label>
+          <textarea id="questionInput" placeholder="例如：怎么通过机制解决跨部门协作？"></textarea>
+          <div class="actions">
+            <button id="askButton">Ask</button>
+            <span id="requestStatus" class="status"></span>
+          </div>
+          <div class="examples" id="exampleButtons"></div>
+        </div>
+
+        <div class="answer-card">
+          <div id="answerTitle" class="section-title">Answer</div>
+          <div id="answerText" class="answer-text">等待提问...</div>
+          <div id="feedbackBox" class="feedback-box hidden">
+            <div id="feedbackPrompt" class="feedback-title">Was this answer helpful?</div>
+            <div class="feedback-actions">
+              <button id="thumbUpButton" class="feedback-btn">Helpful</button>
+              <button id="thumbDownButton" class="feedback-btn muted">Not helpful</button>
+            </div>
+            <textarea id="feedbackComment" class="feedback-comment" placeholder="Optional feedback"></textarea>
+            <button id="submitFeedbackButton" class="submit-feedback">Submit feedback</button>
+            <div id="feedbackStatus" class="status"></div>
+          </div>
+        </div>
+
+        <div class="sources-card">
+          <div class="section-title">Retrieved Chunks</div>
+          <div id="sourcesList" class="sources-list"></div>
+        </div>
+      </section>
+
+      <aside id="debugPanel" class="panel debug-panel hidden">
+        <div id="debugTitle" class="section-title">Debug View</div>
+        <p id="debugDescription" class="debug-note">Visible only in debug mode. Shows retrieval, planner output, selector path, and stage timings.</p>
+
+        <div class="debug-group">
+          <h3>Request</h3>
+          <div id="requestMeta" class="kv-grid"></div>
+        </div>
+
+        <div class="debug-group">
+          <h3>Timings</h3>
+          <div id="timingsGrid" class="timing-grid"></div>
+        </div>
+
+        <div class="debug-group">
+          <h3>Selector</h3>
+          <div id="selectorMeta" class="kv-grid"></div>
+        </div>
+
+        <div class="debug-group">
+          <h3>Router / Planner</h3>
+          <pre id="plannerPre" class="json-box"></pre>
+        </div>
+
+        <div class="debug-group">
+          <h3>Raw Debug JSON</h3>
+          <pre id="debugPre" class="json-box"></pre>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

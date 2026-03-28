@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: traceanswer-demo
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python init_db.py && uvicorn web_demo.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: GENERATION_RUNTIME_PROFILE
+        value: production
+      - key: ENABLE_LLM_SURFACE_GENERATION_V3
+        value: "true"
+      - key: ENABLE_CONTROL_CHECKS
+        value: "true"
+      - key: ENABLE_REWRITE_V3
+        value: "true"
+      - key: ENABLE_FALLBACK_V21
+        value: "true"
+      - key: DEBUG_RETURN_INTERMEDIATE
+        value: "false"
+      - key: DEMO_DEBUG_TOKEN
+        sync: false
+      - key: DEMO_ADMIN_TOKEN
+        sync: false
+      - key: DEMO_SHOW_DEBUG_TOGGLE
+        value: "true"
+      - key: DEMO_RATE_LIMIT_WINDOW_SECONDS
+        value: "60"
+      - key: DEMO_RATE_LIMIT_MAX_REQUESTS
+        value: "12"
