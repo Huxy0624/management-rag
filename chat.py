@@ -27,12 +27,14 @@ from embedding_provider import (
 )
 from rerank import RERANK_CONFIG, build_candidates, rerank_candidates
 from runtime.answer_selector import select_answer
+from runtime.failure_case_logger import detect_failure_case, record_failure_case
 from runtime.llm_surface_runtime import (
     SurfaceGenerationConfigError,
     SurfaceGenerationRuntimeError,
     generate_surface_answer,
 )
 from runtime.planner_runtime import build_planner_context
+from runtime.question_diagnoser import diagnose_question
 from runtime.runtime_config import runtime_config_from_args
 
 
@@ -418,8 +420,11 @@ def _runtime_debug_payload(planner_context: dict[str, object], selection_result:
     final_checks = dict(selection_result.get("final_control_checks", {}))
     return {
         "query_type": planner_context.get("query_type"),
+        "question_diagnosis": planner_context.get("question_diagnosis"),
+        "planning_query": planner_context.get("planning_query"),
         "router_decision": planner_context.get("router_decision"),
         "selected_evidence": planner_context.get("selected_evidence"),
+        "planner_output_v2": planner_context.get("planner_output_v2"),
         "planner_output_v21": planner_context.get("planner_output_v21"),
         "action_translator_output": planner_context.get("action_translator_output"),
         "mechanism_mapper_output": planner_context.get("mechanism_mapper_output"),
@@ -428,9 +433,158 @@ def _runtime_debug_payload(planner_context: dict[str, object], selection_result:
         "selected_from": selection_result.get("selected_from"),
         "mechanism_name_check_pass": final_checks.get("mechanism_name_check_pass"),
         "action_steps_match_count": final_checks.get("action_steps_match_count"),
+        "diagnosis_mode_check_pass": final_checks.get("diagnosis_mode_check_pass"),
+        "diagnosis_fail_reason": final_checks.get("diagnosis_fail_reason"),
         "rewrite_triggered": selection_result.get("rewrite_triggered", False),
         "fallback_triggered": selection_result.get("fallback_triggered", False),
     }
+
+
+def _clarification_debug_payload(question: str, diagnosis_result: dict[str, object]) -> dict[str, object]:
+    return {
+        "query_type": None,
+        "question_diagnosis": diagnosis_result,
+        "planning_query": None,
+        "router_decision": None,
+        "selected_evidence": {"main_evidence": [], "support_evidence": [], "role_conflict_notes": []},
+        "planner_output_v2": None,
+        "planner_output_v21": None,
+        "action_translator_output": None,
+        "mechanism_mapper_output": None,
+        "llm_answer": None,
+        "final_selected_answer": str(diagnosis_result.get("clarification_question", "")),
+        "selected_from": "clarification",
+        "mechanism_name_check_pass": None,
+        "action_steps_match_count": None,
+        "diagnosis_mode_check_pass": True,
+        "diagnosis_fail_reason": "",
+        "rewrite_triggered": False,
+        "fallback_triggered": False,
+        "query": question,
+    }
+
+
+def _empty_generation_trace() -> dict[str, object]:
+    return {
+        "diagnosis": {
+            "question_type": None,
+            "primary_intent": None,
+            "user_role": None,
+            "role_confidence": None,
+            "task_nature": None,
+            "time_horizon": None,
+            "response_mode": None,
+            "root_cause_mode": None,
+            "needs_clarification": False,
+            "clarification_question": None,
+        },
+        "query_rewrites": {
+            "rewrite_for_retrieval": [],
+            "rewrite_for_reasoning": [],
+        },
+        "retrieval": {
+            "query": None,
+            "top_chunks": [],
+        },
+        "planner": {
+            "answer_goal": None,
+            "reasoning_order": [],
+            "advice_mode": None,
+            "root_cause_primary": None,
+            "root_cause_secondary": None,
+            "action_translation": [],
+            "answer_outline": [],
+            "answer_guardrails": [],
+        },
+        "control_layer": {
+            "whether_blocked": False,
+            "triggered_guardrails": [],
+            "rewritten_or_regenerated": False,
+        },
+        "failure_logging": {
+            "failure_logged": False,
+            "failure_type": None,
+        },
+        "final_output": {
+            "final_answer": "",
+        },
+    }
+
+
+def _build_generation_trace(
+    *,
+    question: str,
+    diagnosis_result: dict[str, object] | None,
+    retrieval_rewrites: list[str] | None,
+    retrieval_query: str | None,
+    chunks: list[dict[str, object]] | None,
+    planner_result: dict[str, object] | None,
+    debug_payload: dict[str, object] | None,
+    log_metadata: dict[str, object] | None,
+    final_answer: str,
+    failure_logged: bool = False,
+    failure_type: str | None = None,
+) -> dict[str, object]:
+    trace = _empty_generation_trace()
+    diagnosis = dict(diagnosis_result or {})
+    planner = dict(planner_result or {})
+    debug_payload = dict(debug_payload or {})
+    log_metadata = dict(log_metadata or {})
+    initial_checks = dict(log_metadata.get("initial_control_checks", {}))
+    final_checks = dict(log_metadata.get("final_control_checks", {}))
+    triggered_guardrails: list[str] = []
+    if initial_checks and not bool(initial_checks.get("mechanism_name_check_pass", True)):
+        triggered_guardrails.append("mechanism_name_check_failed")
+    if initial_checks and not bool(initial_checks.get("structure_check_pass", True)):
+        triggered_guardrails.append("how_structure_check_failed")
+    if initial_checks and not bool(initial_checks.get("diagnosis_mode_check_pass", True)):
+        triggered_guardrails.append(str(initial_checks.get("diagnosis_fail_reason", "diagnosis_mode_check_failed")))
+
+    trace["diagnosis"] = {
+        "question_type": diagnosis.get("question_type"),
+        "primary_intent": diagnosis.get("primary_intent"),
+        "user_role": diagnosis.get("user_role"),
+        "role_confidence": diagnosis.get("role_confidence"),
+        "task_nature": diagnosis.get("task_nature"),
+        "time_horizon": diagnosis.get("time_horizon"),
+        "response_mode": diagnosis.get("response_mode"),
+        "root_cause_mode": diagnosis.get("root_cause_mode"),
+        "needs_clarification": diagnosis.get("needs_clarification", False),
+        "clarification_question": diagnosis.get("clarification_question"),
+    }
+    trace["query_rewrites"] = {
+        "rewrite_for_retrieval": list(retrieval_rewrites or []),
+        "rewrite_for_reasoning": list(diagnosis.get("rewrite_for_reasoning", [])),
+    }
+    trace["retrieval"] = {
+        "query": retrieval_query,
+        "top_chunks": build_source_items(chunks or [], limit=len(chunks or [])),
+    }
+    trace["planner"] = {
+        "answer_goal": planner.get("answer_goal"),
+        "reasoning_order": list(planner.get("reasoning_order", [])),
+        "advice_mode": planner.get("advice_mode"),
+        "root_cause_primary": planner.get("root_cause_primary"),
+        "root_cause_secondary": planner.get("root_cause_secondary"),
+        "action_translation": list(planner.get("action_translation", [])),
+        "answer_outline": list(planner.get("answer_outline", [])),
+        "answer_guardrails": list(planner.get("answer_guardrails", [])),
+    }
+    trace["control_layer"] = {
+        "whether_blocked": bool(log_metadata.get("rewrite_triggered") or log_metadata.get("fallback_triggered")),
+        "triggered_guardrails": triggered_guardrails,
+        "rewritten_or_regenerated": bool(debug_payload.get("rewrite_triggered") or debug_payload.get("selected_from") == "rewrite_v3"),
+        "initial_checks": initial_checks,
+        "final_checks": final_checks,
+    }
+    trace["failure_logging"] = {
+        "failure_logged": failure_logged,
+        "failure_type": failure_type,
+    }
+    trace["final_output"] = {
+        "final_answer": final_answer,
+    }
+    return trace
 
 
 def _runtime_log_metadata(
@@ -445,12 +599,15 @@ def _runtime_log_metadata(
         "runtime_path": "planner_v21_llm_v3",
         "runtime_profile": runtime_profile,
         "query_type": planner_context.get("query_type"),
+        "question_type": dict(planner_context.get("question_diagnosis") or {}).get("question_type"),
+        "response_mode": dict(planner_context.get("question_diagnosis") or {}).get("response_mode"),
         "selected_from": selection_result.get("selected_from"),
         "rewrite_triggered": selection_result.get("rewrite_triggered", False),
         "fallback_triggered": selection_result.get("fallback_triggered", False),
         "mechanism_name_check_pass": final_checks.get("mechanism_name_check_pass"),
         "action_steps_match_count": final_checks.get("action_steps_match_count"),
         "structure_check_pass": final_checks.get("structure_check_pass"),
+        "diagnosis_mode_check_pass": final_checks.get("diagnosis_mode_check_pass"),
         "initial_control_checks": initial_checks,
         "final_control_checks": final_checks,
         "control_failure_reasons": {
@@ -482,6 +639,7 @@ def generate_answer_v3_runtime(
     question: str,
     chunks: list[dict[str, object]],
     args: argparse.Namespace,
+    diagnosis_result: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if args.no_rag:
         raise ValueError("The v3 runtime requires retrieval results and does not support --no-rag.")
@@ -489,7 +647,13 @@ def generate_answer_v3_runtime(
     runtime_config = args.runtime_config
     total_started = time.perf_counter()
     planner_started = time.perf_counter()
-    planner_context = build_planner_context(question, chunks, runtime_config.planner)
+    planner_context = build_planner_context(
+        question,
+        chunks,
+        runtime_config.planner,
+        diagnosis_result=diagnosis_result,
+        surface_config=runtime_config.surface,
+    )
     planner_latency_ms = int((time.perf_counter() - planner_started) * 1000)
     context_length = sum(len(str(chunk["document"])) for chunk in chunks)
 
@@ -499,6 +663,8 @@ def generate_answer_v3_runtime(
             query_type=str(planner_context["query_type"]),
             planner_output=dict(planner_context["planner_output_v21"]),
             config=runtime_config.surface,
+            diagnosis_result=dict(planner_context.get("question_diagnosis") or {}),
+            planner_meta=dict(planner_context.get("planner_output_v2") or {}),
         )
         selection_result = select_answer(planner_context, llm_result, runtime_config)
     except (SurfaceGenerationConfigError, SurfaceGenerationRuntimeError) as exc:
@@ -583,6 +749,8 @@ def answer_single_turn_payload(
     args: argparse.Namespace,
 ) -> dict[str, object]:
     runtime_config = args.runtime_config
+    flags = runtime_config.feature_flags
+    use_generation_chain_v2 = bool(flags.enable_generation_chain_v2 and flags.enable_llm_surface_generation_v3)
     request_started = time.perf_counter()
     request_id = str(uuid4())
     session_id = ensure_session_id(args.session_id, question)
@@ -596,12 +764,92 @@ def answer_single_turn_payload(
 
     retrieval_started = time.perf_counter()
     chunks: list[dict[str, object]] = []
+    diagnosis_result: dict[str, object] | None = None
+    retrieval_rewrites: list[str] = []
+    retrieval_query = question
+    if use_generation_chain_v2:
+        diagnosis_result = diagnose_question(question, runtime_config.surface)
+        retrieval_rewrites = list(diagnosis_result.get("rewrite_for_retrieval", []))
+        retrieval_query = str(retrieval_rewrites[0]).strip() if retrieval_rewrites else question
+    if use_generation_chain_v2 and diagnosis_result and bool(diagnosis_result.get("needs_clarification")):
+        clarification_question = str(diagnosis_result.get("clarification_question", "")).strip() or "为了给你更准确的建议，我需要先确认一下你的角色。"
+        add_generation_log(
+            session_id=session_id,
+            message_id=user_message_id,
+            provider="system",
+            model_name="question_diagnoser",
+            prompt_text=json.dumps({"question": question, "diagnosis_result": diagnosis_result}, ensure_ascii=False),
+            prompt_length=len(question),
+            answer=clarification_question,
+            latency_ms=0,
+            retry_count=0,
+            success=True,
+            error_message=None,
+            metadata_json={
+                "runtime_path": "question_diagnosis_clarification",
+                "runtime_profile": runtime_config.metadata.profile_name,
+                "request_id": request_id,
+                "selected_from": "clarification",
+            },
+        )
+        assistant_message_id = add_message(
+            session_id=session_id,
+            role="assistant",
+            content=clarification_question,
+            turn_index=turn_index + 1,
+        )
+        debug_info = _clarification_debug_payload(question, diagnosis_result)
+        debug_info.update(
+            {
+                "request_id": request_id,
+                "session_id": session_id,
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "retrieval_query": None,
+                "reasoning_rewrite": list(diagnosis_result.get("rewrite_for_reasoning", [])),
+                "generation_chain_v2_enabled": use_generation_chain_v2,
+                "timings_ms": {
+                    "retrieval": 0,
+                    "planner": 0,
+                    "generation": 0,
+                    "rewrite": 0,
+                    "total": int((time.perf_counter() - request_started) * 1000),
+                },
+            }
+        )
+        generation_trace = _build_generation_trace(
+            question=question,
+            diagnosis_result=diagnosis_result,
+            retrieval_rewrites=retrieval_rewrites,
+            retrieval_query=None,
+            chunks=[],
+            planner_result=None,
+            debug_payload=debug_info,
+            log_metadata=None,
+            final_answer=clarification_question,
+            failure_logged=False,
+            failure_type=None,
+        )
+        return {
+            "request_id": request_id,
+            "session_id": session_id,
+            "question": question,
+            "answer": clarification_question,
+            "sources": [],
+            "source_text": "",
+            "debug_info": debug_info,
+            "selected_from": "clarification",
+            "fallback_triggered": False,
+            "needs_clarification": True,
+            "clarification_question": clarification_question,
+            "generation_trace": generation_trace,
+        }
     if not args.no_rag:
         if collection is None:
             raise ValueError("Collection is not available while RAG mode is enabled.")
         chunks = retrieve_context(
             collection=collection,
-            question=question,
+            question=retrieval_query,
             embedding_provider=args.embedding_provider,
             embedding_model=args.embedding_model,
             top_k=args.top_k,
@@ -614,7 +862,7 @@ def answer_single_turn_payload(
             session_id=session_id,
             message_id=user_message_id,
             raw_query=question,
-            retrieval_query=question,
+            retrieval_query=retrieval_query,
             top_k=args.top_k,
             retrieved_items_json=build_retrieved_items_json(chunks),
             context_length=context_length,
@@ -622,8 +870,13 @@ def answer_single_turn_payload(
         )
 
     try:
-        if runtime_config.feature_flags.enable_llm_surface_generation_v3:
-            generation_result = generate_answer_v3_runtime(question=question, chunks=chunks, args=args)
+        if use_generation_chain_v2:
+            generation_result = generate_answer_v3_runtime(
+                question=question,
+                chunks=chunks,
+                args=args,
+                diagnosis_result=diagnosis_result,
+            )
         else:
             generation_result = generate_answer(
                 question=question,
@@ -641,9 +894,9 @@ def answer_single_turn_payload(
         add_generation_log(
             session_id=session_id,
             message_id=user_message_id,
-            provider="openai" if runtime_config.feature_flags.enable_llm_surface_generation_v3 else "ollama",
+            provider="openai" if use_generation_chain_v2 else "ollama",
             model_name=runtime_config.surface.model_name
-            if runtime_config.feature_flags.enable_llm_surface_generation_v3
+            if use_generation_chain_v2
             else args.llm_model,
             prompt_text=exc.prompt_text,
             prompt_length=exc.prompt_length,
@@ -653,9 +906,7 @@ def answer_single_turn_payload(
             success=False,
             error_message=str(exc),
             metadata_json={
-                "runtime_path": "planner_v21_llm_v3"
-                if runtime_config.feature_flags.enable_llm_surface_generation_v3
-                else "legacy_ollama",
+                "runtime_path": "planner_v21_llm_v3" if use_generation_chain_v2 else "legacy_ollama",
                 "runtime_profile": runtime_config.metadata.profile_name,
                 "request_id": request_id,
             },
@@ -663,6 +914,40 @@ def answer_single_turn_payload(
         raise
 
     answer = str(generation_result["answer"])
+    failure_logged = False
+    failure_type: str | None = None
+    if use_generation_chain_v2:
+        debug_payload_for_failure = dict(generation_result.get("debug_payload", {}))
+        failure_type, failure_notes = detect_failure_case(
+            original_query=question,
+            diagnosis_result=diagnosis_result,
+            planner_result=dict(debug_payload_for_failure.get("planner_output_v2") or {}),
+            final_answer=answer,
+            triggered_guardrail=bool(
+                dict(generation_result.get("log_metadata", {})).get("rewrite_triggered")
+                or dict(generation_result.get("log_metadata", {})).get("fallback_triggered")
+            ),
+        )
+        if flags.enable_failure_case_logger and failure_type is not None:
+            record_failure_case(
+                original_query=question,
+                diagnosis_result=diagnosis_result,
+                planner_result=dict(debug_payload_for_failure.get("planner_output_v2") or {}),
+                final_answer=answer,
+                triggered_guardrail=bool(
+                    dict(generation_result.get("log_metadata", {})).get("rewrite_triggered")
+                    or dict(generation_result.get("log_metadata", {})).get("fallback_triggered")
+                ),
+                failure_type=failure_type,
+                notes=failure_notes,
+                output_path=runtime_config.failure_case_log_path,
+                enabled=True,
+                extra={
+                    "request_id": request_id,
+                    "selected_from": debug_payload_for_failure.get("selected_from"),
+                },
+            )
+            failure_logged = True
     add_generation_log(
         session_id=session_id,
         message_id=user_message_id,
@@ -702,7 +987,12 @@ def answer_single_turn_payload(
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
             "query": question,
-            "retrieval_query": question,
+            "retrieval_query": retrieval_query,
+            "reasoning_rewrite": list((diagnosis_result or {}).get("rewrite_for_reasoning", [])),
+            "question_diagnosis": diagnosis_result,
+            "generation_chain_v2_enabled": use_generation_chain_v2,
+            "failure_logged": failure_logged,
+            "failure_type": failure_type,
             "timings_ms": {
                 "retrieval": retrieval_latency_ms,
                 "planner": planner_latency_ms,
@@ -711,6 +1001,19 @@ def answer_single_turn_payload(
                 "total": total_latency_ms,
             },
         }
+    )
+    generation_trace = _build_generation_trace(
+        question=question,
+        diagnosis_result=diagnosis_result,
+        retrieval_rewrites=retrieval_rewrites,
+        retrieval_query=retrieval_query,
+        chunks=chunks,
+        planner_result=dict(debug_info.get("planner_output_v2") or {}),
+        debug_payload=debug_info,
+        log_metadata=dict(generation_result.get("log_metadata", {})),
+        final_answer=answer,
+        failure_logged=failure_logged,
+        failure_type=failure_type,
     )
 
     return {
@@ -723,6 +1026,9 @@ def answer_single_turn_payload(
         "debug_info": debug_info,
         "selected_from": debug_info.get("selected_from"),
         "fallback_triggered": bool(debug_info.get("fallback_triggered", False)),
+        "needs_clarification": False,
+        "clarification_question": None,
+        "generation_trace": generation_trace,
     }
 
 

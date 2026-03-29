@@ -19,9 +19,12 @@ DEFAULT_RUNTIME_PROFILE = "production"
 PROFILE_ENV_VAR = "GENERATION_RUNTIME_PROFILE"
 
 ENV_ENABLE_LLM_SURFACE_GENERATION_V3 = "ENABLE_LLM_SURFACE_GENERATION_V3"
+ENV_ENABLE_GENERATION_CHAIN_V2 = "ENABLE_GENERATION_CHAIN_V2"
 ENV_ENABLE_CONTROL_CHECKS = "ENABLE_CONTROL_CHECKS"
 ENV_ENABLE_REWRITE_V3 = "ENABLE_REWRITE_V3"
 ENV_ENABLE_FALLBACK_V21 = "ENABLE_FALLBACK_V21"
+ENV_ENABLE_FAILURE_CASE_LOGGER = "ENABLE_FAILURE_CASE_LOGGER"
+ENV_FAILURE_CASE_LOG_PATH = "FAILURE_CASE_LOG_PATH"
 ENV_DEBUG_RETURN_INTERMEDIATE = "DEBUG_RETURN_INTERMEDIATE"
 ENV_OPENAI_API_KEY = "OPENAI_API_KEY"
 ENV_OPENAI_BASE_URL = "OPENAI_BASE_URL"
@@ -32,33 +35,41 @@ ENV_OPENAI_MAX_RETRIES = "OPENAI_MAX_RETRIES"
 
 @dataclass(frozen=True)
 class RuntimeProfileDefaults:
+    enable_generation_chain_v2: bool
     enable_llm_surface_generation_v3: bool
     enable_control_checks: bool
     enable_rewrite_v3: bool
     enable_fallback_v21: bool
+    enable_failure_case_logger: bool
     debug_return_intermediate: bool
 
 
 RUNTIME_PROFILES: dict[str, RuntimeProfileDefaults] = {
     "local_dev": RuntimeProfileDefaults(
+        enable_generation_chain_v2=True,
         enable_llm_surface_generation_v3=True,
         enable_control_checks=True,
         enable_rewrite_v3=True,
         enable_fallback_v21=True,
+        enable_failure_case_logger=False,
         debug_return_intermediate=True,
     ),
     "staging": RuntimeProfileDefaults(
+        enable_generation_chain_v2=True,
         enable_llm_surface_generation_v3=True,
         enable_control_checks=True,
         enable_rewrite_v3=True,
         enable_fallback_v21=True,
+        enable_failure_case_logger=False,
         debug_return_intermediate=False,
     ),
     "production": RuntimeProfileDefaults(
+        enable_generation_chain_v2=True,
         enable_llm_surface_generation_v3=True,
         enable_control_checks=True,
         enable_rewrite_v3=True,
         enable_fallback_v21=True,
+        enable_failure_case_logger=False,
         debug_return_intermediate=False,
     ),
 }
@@ -66,10 +77,12 @@ RUNTIME_PROFILES: dict[str, RuntimeProfileDefaults] = {
 
 @dataclass(frozen=True)
 class FeatureFlags:
+    enable_generation_chain_v2: bool = True
     enable_llm_surface_generation_v3: bool = False
     enable_control_checks: bool = True
     enable_rewrite_v3: bool = True
     enable_fallback_v21: bool = True
+    enable_failure_case_logger: bool = False
     debug_return_intermediate: bool = False
 
 
@@ -104,6 +117,7 @@ class GenerationRuntimeConfig:
     feature_flags: FeatureFlags
     surface: SurfaceRuntimeConfig
     planner: PlannerRuntimeConfig
+    failure_case_log_path: Path
 
 
 def parse_bool(value: str | None) -> bool | None:
@@ -169,6 +183,14 @@ def runtime_config_from_args(args) -> GenerationRuntimeConfig:
     env_overrides: dict[str, Any] = {"profile": profile_name}
     cli_overrides: dict[str, Any] = {}
 
+    enable_generation_chain_v2, cli_set, env_set = _resolve_bool(
+        args, "enable_generation_chain_v2", ENV_ENABLE_GENERATION_CHAIN_V2, profile.enable_generation_chain_v2
+    )
+    if cli_set:
+        cli_overrides["enable_generation_chain_v2"] = enable_generation_chain_v2
+    elif env_set:
+        env_overrides[ENV_ENABLE_GENERATION_CHAIN_V2] = enable_generation_chain_v2
+
     enable_llm_surface_generation_v3, cli_set, env_set = _resolve_bool(
         args, "enable_llm_surface_generation_v3", ENV_ENABLE_LLM_SURFACE_GENERATION_V3, profile.enable_llm_surface_generation_v3
     )
@@ -200,6 +222,14 @@ def runtime_config_from_args(args) -> GenerationRuntimeConfig:
         cli_overrides["enable_fallback_v21"] = enable_fallback_v21
     elif env_set:
         env_overrides[ENV_ENABLE_FALLBACK_V21] = enable_fallback_v21
+
+    enable_failure_case_logger, cli_set, env_set = _resolve_bool(
+        args, "enable_failure_case_logger", ENV_ENABLE_FAILURE_CASE_LOGGER, profile.enable_failure_case_logger
+    )
+    if cli_set:
+        cli_overrides["enable_failure_case_logger"] = enable_failure_case_logger
+    elif env_set:
+        env_overrides[ENV_ENABLE_FAILURE_CASE_LOGGER] = enable_failure_case_logger
 
     debug_return_intermediate, cli_set, env_set = _resolve_bool(
         args, "debug_return_intermediate", ENV_DEBUG_RETURN_INTERMEDIATE, profile.debug_return_intermediate
@@ -241,6 +271,12 @@ def runtime_config_from_args(args) -> GenerationRuntimeConfig:
     elif env_set:
         env_overrides[ENV_OPENAI_MAX_RETRIES] = max_retries
 
+    failure_case_log_path, cli_set, env_set = _resolve_str(args, "failure_case_log_path", ENV_FAILURE_CASE_LOG_PATH, "logs/generation_failures.jsonl")
+    if cli_set:
+        cli_overrides["failure_case_log_path"] = failure_case_log_path
+    elif env_set:
+        env_overrides[ENV_FAILURE_CASE_LOG_PATH] = failure_case_log_path
+
     prompt_path = Path(str(getattr(args, "surface_prompt_path", DEFAULT_SURFACE_PROMPT_PATH) or DEFAULT_SURFACE_PROMPT_PATH))
     rewrite_prompt_path = Path(
         str(getattr(args, "rewrite_prompt_path", DEFAULT_REWRITE_PROMPT_PATH) or DEFAULT_REWRITE_PROMPT_PATH)
@@ -253,10 +289,12 @@ def runtime_config_from_args(args) -> GenerationRuntimeConfig:
         cli_overrides=cli_overrides,
     )
     feature_flags = FeatureFlags(
+        enable_generation_chain_v2=enable_generation_chain_v2,
         enable_llm_surface_generation_v3=enable_llm_surface_generation_v3,
         enable_control_checks=enable_control_checks,
         enable_rewrite_v3=enable_rewrite_v3,
         enable_fallback_v21=enable_fallback_v21,
+        enable_failure_case_logger=enable_failure_case_logger,
         debug_return_intermediate=debug_return_intermediate,
     )
     surface = SurfaceRuntimeConfig(
@@ -270,4 +308,10 @@ def runtime_config_from_args(args) -> GenerationRuntimeConfig:
         base_url=base_url,
     )
     planner = PlannerRuntimeConfig()
-    return GenerationRuntimeConfig(metadata=metadata, feature_flags=feature_flags, surface=surface, planner=planner)
+    return GenerationRuntimeConfig(
+        metadata=metadata,
+        feature_flags=feature_flags,
+        surface=surface,
+        planner=planner,
+        failure_case_log_path=Path(str(failure_case_log_path or "logs/generation_failures.jsonl")),
+    )

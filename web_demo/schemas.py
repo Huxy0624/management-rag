@@ -19,8 +19,11 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[dict[str, Any]]
     debug_info: dict[str, Any]
+    generation_trace: dict[str, Any]
     selected_from: str | None = None
     fallback_triggered: bool = False
+    needs_clarification: bool = False
+    clarification_question: str | None = None
 
 
 class HealthResponse(BaseModel):
