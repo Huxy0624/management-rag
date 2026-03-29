@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from runtime.experiment_bridge import get_v1, get_v2, get_v21
-from runtime.query_router import infer_query_type, route_query
-from runtime.runtime_config import PlannerRuntimeConfig
+from runtime.planner_runtime_v2 import build_planner_v2
+from runtime.query_router import infer_query_type, route_query, route_query_with_diagnosis
+from runtime.question_diagnoser import diagnosis_to_query_type
+from runtime.runtime_config import PlannerRuntimeConfig, SurfaceRuntimeConfig
 
 
 DEFINITION_PATTERNS = ("本质是", "核心是", "定义是", "可以定义为", "就是")
@@ -102,30 +104,53 @@ def build_selected_evidence(question: str, chunks: list[dict[str, Any]], query_t
     }
 
 
-def build_planner_context(question: str, chunks: list[dict[str, Any]], config: PlannerRuntimeConfig) -> dict[str, Any]:
-    query_type = infer_query_type(question)
-    router = route_query(question)
+def build_planner_context(
+    question: str,
+    chunks: list[dict[str, Any]],
+    config: PlannerRuntimeConfig,
+    diagnosis_result: dict[str, Any] | None = None,
+    surface_config: SurfaceRuntimeConfig | None = None,
+) -> dict[str, Any]:
+    planning_query = question
+    if diagnosis_result:
+        rewrites = list(diagnosis_result.get("rewrite_for_reasoning", []))
+        if rewrites:
+            planning_query = str(rewrites[0])
+        query_type = diagnosis_to_query_type(diagnosis_result)
+        router = route_query_with_diagnosis(planning_query, diagnosis_result)
+    else:
+        query_type = infer_query_type(question)
+        router = route_query(question)
     selected = build_selected_evidence(question, chunks, query_type, config)
+    planner_output_v2 = build_planner_v2(
+        original_query=question,
+        diagnosis_result=diagnosis_result or {},
+        retrieved_chunks=chunks,
+        config=surface_config,
+    )
     v2 = get_v2()
     v21 = get_v21()
 
     if query_type == "how":
-        planner_output, action_output, mechanism_output = v21.plan_how_v21(question, router, selected)
+        planner_output, action_output, mechanism_output = v21.plan_how_v21(planning_query, router, selected)
     elif query_type == "what":
-        planner_output = v2.plan_what(question, router, selected)
+        planner_output = v2.plan_what(planning_query, router, selected)
         action_output = {"translator_name": "not_applicable", "action_steps": []}
         mechanism_output = {"mapper_name": "not_applicable", "mechanism_entities": []}
     else:
-        planner_output = v2.plan_why(question, router, selected)
+        planner_output = v2.plan_why(planning_query, router, selected)
         action_output = {"translator_name": "not_applicable", "action_steps": []}
         mechanism_output = {"mapper_name": "not_applicable", "mechanism_entities": []}
 
     fallback_answer = v21.surface_generate_v21(question, query_type, router, planner_output)
     return {
         "query": question,
+        "planning_query": planning_query,
         "query_type": query_type,
         "router_decision": router,
+        "question_diagnosis": diagnosis_result,
         "selected_evidence": selected,
+        "planner_output_v2": planner_output_v2,
         "planner_output_v21": planner_output,
         "action_translator_output": action_output,
         "mechanism_mapper_output": mechanism_output,

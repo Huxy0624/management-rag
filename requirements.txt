@@ -1,6 +1,7 @@
-chromadb
-openai
-sentence-transformers
-fastapi
-uvicorn
-requests
+# Minimal stack for cloud demo (Render free tier): no torch / transformers / sentence-transformers.
+# Local GPU/CPU embeddings: pip install -r requirements-optional-embeddings.txt
+chromadb>=0.4.22,<0.6
+openai>=1.40.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+requests>=2.31.0

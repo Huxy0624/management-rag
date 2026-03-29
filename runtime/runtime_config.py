@@ -15,7 +15,8 @@ DEFAULT_SURFACE_MAX_RETRIES = 2
 DEFAULT_SURFACE_RETRY_DELAY_SECONDS = 2
 DEFAULT_MAIN_EVIDENCE_COUNT = 2
 DEFAULT_SUPPORT_EVIDENCE_COUNT = 2
-DEFAULT_RUNTIME_PROFILE = "production"
+# Default to a lighter profile suitable for small cloud instances (fewer LLM round-trips).
+DEFAULT_RUNTIME_PROFILE = "render_lite"
 PROFILE_ENV_VAR = "GENERATION_RUNTIME_PROFILE"
 
 ENV_ENABLE_LLM_SURFACE_GENERATION_V3 = "ENABLE_LLM_SURFACE_GENERATION_V3"
@@ -69,6 +70,15 @@ RUNTIME_PROFILES: dict[str, RuntimeProfileDefaults] = {
         enable_control_checks=True,
         enable_rewrite_v3=True,
         enable_fallback_v21=True,
+        enable_failure_case_logger=False,
+        debug_return_intermediate=False,
+    ),
+    "render_lite": RuntimeProfileDefaults(
+        enable_generation_chain_v2=True,
+        enable_llm_surface_generation_v3=True,
+        enable_control_checks=False,
+        enable_rewrite_v3=False,
+        enable_fallback_v21=False,
         enable_failure_case_logger=False,
         debug_return_intermediate=False,
     ),

@@ -37,7 +37,25 @@ def load_prompt(prompt_path: Path) -> str:
     return prompt_path.read_text(encoding="utf-8")
 
 
-def build_style_instruction(query_type: str, planner_output: dict[str, Any]) -> str:
+def build_style_instruction(
+    query_type: str,
+    planner_output: dict[str, Any],
+    diagnosis_result: dict[str, Any] | None = None,
+    planner_meta: dict[str, Any] | None = None,
+) -> str:
+    diagnosis_result = diagnosis_result or {}
+    planner_meta = planner_meta or {}
+    diagnosis_question_type = str(diagnosis_result.get("question_type", ""))
+    time_horizon = str(diagnosis_result.get("time_horizon", ""))
+    task_nature = str(diagnosis_result.get("task_nature", ""))
+    if diagnosis_question_type in {"root_cause_judgment", "responsibility_boundary"}:
+        return "写成先定性、再归因、最后建议的诊断型回答，不能直接写成 SOP。"
+    if task_nature == "uncertain":
+        return "写成判断框架和经验辅导优先的回答，先帮助用户判断，再谈动作，不要强行 SOP 化。"
+    if time_horizon == "current_case":
+        return "优先回答当前个案怎么判断和怎么收口，机制化建议只能放在结尾轻量补充。"
+    if str(planner_meta.get("advice_mode", "")) == "mechanism_first":
+        return "先给机制化治理思路，再补当前落地动作，避免一开始就给泛化 SOP。"
     if query_type == "what":
         return "写成定义先行、边界补充、例子点到即止的短答案。"
     if query_type == "why":
@@ -47,7 +65,17 @@ def build_style_instruction(query_type: str, planner_output: dict[str, Any]) -> 
     return "写成可执行动作说明，保留步骤顺序，并把对象、动作、交付物说清楚。"
 
 
-def build_constraints(query_type: str, planner_output: dict[str, Any]) -> list[str]:
+def build_constraints(
+    query_type: str,
+    planner_output: dict[str, Any],
+    diagnosis_result: dict[str, Any] | None = None,
+    planner_meta: dict[str, Any] | None = None,
+) -> list[str]:
+    diagnosis_result = diagnosis_result or {}
+    planner_meta = planner_meta or {}
+    diagnosis_question_type = str(diagnosis_result.get("question_type", ""))
+    time_horizon = str(diagnosis_result.get("time_horizon", ""))
+    task_nature = str(diagnosis_result.get("task_nature", ""))
     constraints = [
         "不要引用 raw evidence，不要补充 planner_output 之外的新事实。",
         "不要改变 planner_output 中步骤、因果链或定义边界的顺序。",
@@ -62,16 +90,55 @@ def build_constraints(query_type: str, planner_output: dict[str, Any]) -> list[s
         constraints.extend(["第一句必须动作导向。", "每一步都要保留动作对象、动作行为、输出结果。"])
         if planner_output.get("solution_mode") == "mechanism_building":
             constraints.append("必须明确写出机制名称、责任人、执行节奏、关键字段或输出。")
+    if diagnosis_question_type in {"root_cause_judgment", "responsibility_boundary"}:
+        constraints.extend(
+            [
+                "这是诊断类问题，必须先回答为什么会这样或责任边界在哪里，不能直接进入 SOP 步骤。",
+                "优先保留信息失真 / 评价失效 / 主因 / 次因 / 系统责任等诊断框架。",
+                "如果要给建议，只能放在结尾，不能盖过诊断主体。",
+                "禁止以“第一步、第二步、第三步”开头。",
+            ]
+        )
+    if time_horizon == "current_case":
+        constraints.extend(
+            [
+                "优先回答当前个案的判断和收口建议。",
+                "机制化建议只能放在结尾，且篇幅不能喧宾夺主。",
+            ]
+        )
+    if task_nature == "uncertain":
+        constraints.extend(
+            [
+                "优先给判断框架、对话策略、经验性辅导。",
+                "不要强行写成 SOP 或 checklist。",
+            ]
+        )
+    if task_nature == "deterministic" and query_type == "how":
+        constraints.append("这类问题可以使用 SOP/checklist 风格，但仍要遵守 planner 给出的顺序和 guardrails。")
+    if planner_meta.get("reasoning_order"):
+        constraints.append("回答顺序必须跟随 planner_meta.reasoning_order，不要打乱顺序。")
+    if planner_meta.get("answer_outline"):
+        constraints.append("回答主体必须覆盖 planner_meta.answer_outline，且优先按其顺序展开。")
+    if planner_meta.get("answer_guardrails"):
+        constraints.append("必须遵守 planner_meta.answer_guardrails，避免角色越位和泛化表达。")
     return constraints
 
 
-def build_surface_payload(query: str, query_type: str, planner_output: dict[str, Any]) -> dict[str, Any]:
+def build_surface_payload(
+    query: str,
+    query_type: str,
+    planner_output: dict[str, Any],
+    diagnosis_result: dict[str, Any] | None = None,
+    planner_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "query": query,
         "query_type": query_type,
+        "question_diagnosis": diagnosis_result or {},
+        "planner_meta": planner_meta or {},
         "planner_output": planner_output,
-        "style_instruction": build_style_instruction(query_type, planner_output),
-        "constraints": build_constraints(query_type, planner_output),
+        "style_instruction": build_style_instruction(query_type, planner_output, diagnosis_result, planner_meta),
+        "constraints": build_constraints(query_type, planner_output, diagnosis_result, planner_meta),
     }
 
 
@@ -141,9 +208,16 @@ def request_llm_answer(prompt_text: str, user_text: str, config: SurfaceRuntimeC
     )
 
 
-def generate_surface_answer(query: str, query_type: str, planner_output: dict[str, Any], config: SurfaceRuntimeConfig) -> dict[str, Any]:
+def generate_surface_answer(
+    query: str,
+    query_type: str,
+    planner_output: dict[str, Any],
+    config: SurfaceRuntimeConfig,
+    diagnosis_result: dict[str, Any] | None = None,
+    planner_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     prompt_text = load_prompt(config.prompt_path)
-    payload = build_surface_payload(query, query_type, planner_output)
+    payload = build_surface_payload(query, query_type, planner_output, diagnosis_result, planner_meta)
     user_text = "请严格根据以下 JSON 输入生成答案，只输出答案正文，不要解释你的做法。\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     started = time.perf_counter()
     answer, usage, retry_count = request_llm_answer(prompt_text, user_text, config=config, temperature=0.2)

@@ -134,6 +134,7 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
             "request_id": result["request_id"],
             "session_id": result["session_id"],
             "selected_from": result.get("selected_from"),
+            "generation_chain_v2_enabled": dict(result.get("debug_info", {})).get("generation_chain_v2_enabled"),
             "fallback_triggered": result.get("fallback_triggered", False),
             "timings_ms": dict(result.get("debug_info", {}).get("timings_ms", {})),
         }

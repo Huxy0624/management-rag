@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
-import chromadb
 import requests
 
 from db_utils import (
@@ -131,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--runtime-profile",
-        choices=["local_dev", "staging", "production"],
+        choices=["local_dev", "staging", "production", "render_lite"],
         help="Runtime profile for v3 defaults. Falls back to GENERATION_RUNTIME_PROFILE.",
     )
     parser.add_argument(
@@ -253,7 +254,7 @@ def preview_text(text: str, limit: int = 300) -> str:
 
 
 def retrieve_context(
-    collection: chromadb.Collection,
+    collection: Any,
     question: str,
     embedding_provider: str,
     embedding_model: str | None,
@@ -407,13 +408,18 @@ def ensure_session_id(
     return create_session(title=title, db_path=db_path)
 
 
-def load_collection_from_args(args: argparse.Namespace) -> chromadb.Collection | None:
+def load_collection_from_args(args: argparse.Namespace) -> Any | None:
     if args.no_rag:
         return None
     if not args.db_dir.exists():
-        raise FileNotFoundError(f"Chroma database directory not found: {args.db_dir}")
-    chroma_client = chromadb.PersistentClient(path=str(args.db_dir))
-    return chroma_client.get_collection(name=args.collection)
+        return None
+    try:
+        import chromadb
+
+        chroma_client = chromadb.PersistentClient(path=str(args.db_dir))
+        return chroma_client.get_collection(name=args.collection)
+    except Exception:
+        return None
 
 
 def _runtime_debug_payload(planner_context: dict[str, object], selection_result: dict[str, object]) -> dict[str, object]:
@@ -462,6 +468,11 @@ def _clarification_debug_payload(question: str, diagnosis_result: dict[str, obje
         "fallback_triggered": False,
         "query": question,
     }
+
+
+def empty_generation_trace() -> dict[str, object]:
+    """Public alias for lite / HTTP fallback responses."""
+    return _empty_generation_trace()
 
 
 def _empty_generation_trace() -> dict[str, object]:
@@ -744,7 +755,7 @@ def generate_answer_v3_runtime(
 
 
 def answer_single_turn_payload(
-    collection: chromadb.Collection | None,
+    collection: Any | None,
     question: str,
     args: argparse.Namespace,
 ) -> dict[str, object]:
@@ -1213,7 +1224,7 @@ def generate_answer(
 
 
 def run_single_turn(
-    collection: chromadb.Collection | None,
+    collection: Any | None,
     question: str,
     args: argparse.Namespace,
 ) -> str:
@@ -1249,9 +1260,17 @@ def run() -> None:
             "Please run `python init_db.py` first."
         )
 
-    collection: chromadb.Collection | None = None
+    collection: Any | None = None
     if not args.no_rag:
         collection = load_collection_from_args(args)
+    if collection is None and not args.no_rag:
+        print(
+            "Warning: Chroma is missing or unavailable; continuing without vector retrieval.",
+            file=sys.stderr,
+        )
+        args = argparse.Namespace(**vars(args))
+        args.no_rag = True
+        args.runtime_config = runtime_config_from_args(args)
 
     if args.debug:
         print(f"[debug] runtime_profile={args.runtime_config.metadata.profile_name}")

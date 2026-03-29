@@ -17,9 +17,13 @@ def build_rewrite_payload(row: dict[str, Any], current_answer: str, control_chec
             "how 结构未完整保留 3 步动作，当前只匹配到 "
             f"{control_checks['action_steps_match_count']}/{control_checks['expected_action_steps_count']}"
         )
+    if not control_checks.get("diagnosis_mode_check_pass", True):
+        detected_issues.append("diagnosis 问题被改写偏了：" + str(control_checks.get("diagnosis_fail_reason", "")))
     return {
         "query": row["query"],
         "query_type": row["query_type"],
+        "question_diagnosis": row.get("question_diagnosis"),
+        "planner_meta": row.get("planner_output_v2"),
         "planner_output": row["planner_output_v21"],
         "current_answer": current_answer,
         "detected_issues": detected_issues,

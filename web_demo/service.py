@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from functools import lru_cache
 from uuid import uuid4
 
@@ -9,7 +10,6 @@ from chat import (
     DEFAULT_COLLECTION,
     DEFAULT_DB_DIR,
     DEFAULT_LLM_MODEL,
-    DEFAULT_TOP_K,
     DEFAULT_OLLAMA_URL,
     OLLAMA_CONNECT_TIMEOUT_SECONDS,
     OLLAMA_MAX_RETRIES,
@@ -19,19 +19,28 @@ from chat import (
 )
 from embedding_provider import DEFAULT_EMBEDDING_PROVIDER
 from runtime.runtime_config import runtime_config_from_args
+from web_demo.lite_fallback import no_openai_key_response, openai_completion_fallback_response
 from web_demo.request_store import save_request_log
 
 
+def _has_openai_key() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+
 def build_demo_args() -> argparse.Namespace:
+    has_key = _has_openai_key()
+    # Without an API key we cannot call OpenAI embeddings or the v3 LLM stack; skip retrieval up front.
+    no_rag = not has_key
+
     args = argparse.Namespace(
         question=None,
         session_id=None,
-        no_rag=False,
+        no_rag=no_rag,
         db_dir=DEFAULT_DB_DIR,
         collection=DEFAULT_COLLECTION,
         embedding_provider=DEFAULT_EMBEDDING_PROVIDER,
         embedding_model=None,
-        top_k=DEFAULT_TOP_K if DEFAULT_TOP_K >= 5 else 5,
+        top_k=2,
         llm_model=DEFAULT_LLM_MODEL,
         ollama_url=DEFAULT_OLLAMA_URL,
         ollama_read_timeout=OLLAMA_READ_TIMEOUT_SECONDS,
@@ -40,10 +49,13 @@ def build_demo_args() -> argparse.Namespace:
         context_char_limit=CONTEXT_CHAR_LIMIT,
         debug=False,
         runtime_profile=None,
+        enable_generation_chain_v2=None,
         enable_llm_surface_generation_v3=None,
         enable_control_checks=None,
         enable_rewrite_v3=None,
         enable_fallback_v21=None,
+        enable_failure_case_logger=None,
+        failure_case_log_path=None,
         debug_return_intermediate=None,
         surface_model=None,
         surface_prompt_path="prompts/generation_v3/answer_prompt_v3.txt",
@@ -65,7 +77,13 @@ def get_base_args() -> argparse.Namespace:
 
 @lru_cache(maxsize=1)
 def get_collection():
-    return load_collection_from_args(get_base_args())
+    base = get_base_args()
+    if base.no_rag:
+        return None
+    try:
+        return load_collection_from_args(base)
+    except Exception:
+        return None
 
 
 def clone_args_for_request(session_id: str | None, debug: bool) -> argparse.Namespace:
@@ -84,21 +102,51 @@ def ask_question(
     client_ip: str | None = None,
     user_mode: str = "user",
 ) -> dict:
-    args = clone_args_for_request(session_id=session_id, debug=debug)
-    collection = get_collection()
-    try:
-        result = answer_single_turn_payload(collection=collection, question=question, args=args)
-    except Exception as exc:
+    if not _has_openai_key():
+        result = no_openai_key_response(question=question, session_id=session_id, debug=debug)
+        debug_info = dict(result.get("debug_info", {}))
+        total_latency_ms = int(dict(debug_info.get("timings_ms", {})).get("total", 0))
         save_request_log(
-            request_id=f"failed-{uuid4()}",
+            request_id=str(result["request_id"]),
             question=question,
-            success=False,
-            session_id=session_id,
-            error_message=str(exc),
+            success=True,
+            session_id=str(result["session_id"]),
+            selected_from=result.get("selected_from"),
+            fallback_triggered=False,
+            total_latency_ms=total_latency_ms,
             client_ip=client_ip,
             user_mode=user_mode,
         )
-        raise
+        return result
+
+    args = clone_args_for_request(session_id=session_id, debug=debug)
+    collection = get_collection()
+    if collection is None and not args.no_rag:
+        args = argparse.Namespace(**vars(args))
+        args.no_rag = True
+        args.runtime_config = runtime_config_from_args(args)
+
+    try:
+        result = answer_single_turn_payload(collection=collection, question=question, args=args)
+    except Exception as exc:
+        try:
+            result = openai_completion_fallback_response(
+                question=question,
+                session_id=session_id,
+                prior_error=str(exc),
+                debug=debug,
+            )
+        except Exception as fb_exc:
+            save_request_log(
+                request_id=f"failed-{uuid4()}",
+                question=question,
+                success=False,
+                session_id=session_id,
+                error_message=f"{exc!s} | fallback_failed: {fb_exc!s}",
+                client_ip=client_ip,
+                user_mode=user_mode,
+            )
+            raise fb_exc from exc
 
     debug_info = dict(result.get("debug_info", {}))
     total_latency_ms = int(dict(debug_info.get("timings_ms", {})).get("total", 0))

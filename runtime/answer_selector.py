@@ -27,6 +27,8 @@ def select_answer(row: dict[str, Any], llm_result: dict[str, Any] | None, config
         "action_steps_match_count": None,
         "expected_action_steps_count": None,
         "structure_check_pass": True,
+        "diagnosis_mode_check_pass": True,
+        "diagnosis_fail_reason": "",
         "contains_generic_filler": False,
     }
     result: dict[str, Any] = {
@@ -74,7 +76,11 @@ def select_answer(row: dict[str, Any], llm_result: dict[str, Any] | None, config
     result["initial_control_checks"] = initial_checks
     result["final_control_checks"] = initial_checks
 
-    if initial_checks["mechanism_name_check_pass"] and initial_checks["structure_check_pass"]:
+    if (
+        initial_checks["mechanism_name_check_pass"]
+        and initial_checks["structure_check_pass"]
+        and initial_checks.get("diagnosis_mode_check_pass", True)
+    ):
         result.update(
             {
                 "final_selected_answer": llm_answer,
@@ -101,7 +107,11 @@ def select_answer(row: dict[str, Any], llm_result: dict[str, Any] | None, config
             result["timings_ms"]["rewrite"] = int(rewrite_result.get("latency_ms", 0))
             rewrite_checks = build_control_checks(row, rewrite_answer_text)
             result["final_control_checks"] = rewrite_checks
-            if rewrite_checks["mechanism_name_check_pass"] and rewrite_checks["structure_check_pass"]:
+            if (
+                rewrite_checks["mechanism_name_check_pass"]
+                and rewrite_checks["structure_check_pass"]
+                and rewrite_checks.get("diagnosis_mode_check_pass", True)
+            ):
                 result.update(
                     {
                         "final_selected_answer": rewrite_answer_text,
