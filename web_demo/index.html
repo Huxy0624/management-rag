@@ -31,7 +31,7 @@
           <label for="questionInput">Ask a management question</label>
           <textarea id="questionInput" placeholder="例如：怎么通过机制解决跨部门协作？"></textarea>
           <div class="actions">
-            <button id="askButton">Ask</button>
+            <button id="askButton" type="button">Ask</button>
             <span id="requestStatus" class="status"></span>
           </div>
           <div class="examples" id="exampleButtons"></div>
@@ -43,11 +43,11 @@
           <div id="feedbackBox" class="feedback-box hidden">
             <div id="feedbackPrompt" class="feedback-title">Was this answer helpful?</div>
             <div class="feedback-actions">
-              <button id="thumbUpButton" class="feedback-btn">Helpful</button>
-              <button id="thumbDownButton" class="feedback-btn muted">Not helpful</button>
+              <button id="thumbUpButton" type="button" class="feedback-btn">Helpful</button>
+              <button id="thumbDownButton" type="button" class="feedback-btn muted">Not helpful</button>
             </div>
             <textarea id="feedbackComment" class="feedback-comment" placeholder="Optional feedback"></textarea>
-            <button id="submitFeedbackButton" class="submit-feedback">Submit feedback</button>
+            <button id="submitFeedbackButton" type="button" class="submit-feedback">Submit feedback</button>
             <div id="feedbackStatus" class="status"></div>
           </div>
         </div>

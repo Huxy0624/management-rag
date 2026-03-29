@@ -190,6 +190,9 @@ async function fetchConfig() {
 }
 
 async function askQuestion() {
+  if (!questionInput || !askButton) {
+    return;
+  }
   const question = questionInput.value.trim();
   if (!question) {
     requestStatus.textContent = "Please enter a question.";
@@ -200,14 +203,15 @@ async function askQuestion() {
   requestStatus.textContent = "Running pipeline...";
 
   try {
-    const response = await fetch("/api/ask", {
+    const payload = {
+      question,
+      debug: debugRequested,
+      debug_token: debugToken
+    };
+    const response = await window.fetch("/api/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question,
-        debug: debugRequested,
-        debug_token: debugToken
-      })
+      body: JSON.stringify(payload)
     });
     const data = await response.json();
     if (!response.ok) {
@@ -250,16 +254,41 @@ async function submitFeedback() {
   }
 }
 
-askButton.addEventListener("click", askQuestion);
-submitFeedbackButton.addEventListener("click", submitFeedback);
-thumbUpButton.addEventListener("click", () => setSelectedRating("up"));
-thumbDownButton.addEventListener("click", () => setSelectedRating("down"));
-questionInput.addEventListener("keydown", (event) => {
-  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-    askQuestion();
+function initializePage() {
+  if (askButton) {
+    askButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      askQuestion();
+    });
   }
-});
+  if (submitFeedbackButton) {
+    submitFeedbackButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      submitFeedback();
+    });
+  }
+  if (thumbUpButton) {
+    thumbUpButton.addEventListener("click", () => setSelectedRating("up"));
+  }
+  if (thumbDownButton) {
+    thumbDownButton.addEventListener("click", () => setSelectedRating("down"));
+  }
+  if (questionInput) {
+    questionInput.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        askQuestion();
+      }
+    });
+  }
 
-renderExamplesFallback();
-fetchHealth();
-fetchConfig();
+  renderExamplesFallback();
+  fetchHealth();
+  fetchConfig();
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initializePage);
+} else {
+  initializePage();
+}
