@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from functools import lru_cache
 from uuid import uuid4
@@ -15,12 +16,14 @@ from chat import (
     OLLAMA_MAX_RETRIES,
     OLLAMA_READ_TIMEOUT_SECONDS,
     answer_single_turn_payload,
-    load_collection_from_args,
+    load_chroma_collection,
 )
 from embedding_provider import DEFAULT_EMBEDDING_PROVIDER
 from runtime.runtime_config import runtime_config_from_args
 from web_demo.lite_fallback import no_openai_key_response
 from web_demo.request_store import save_request_log
+
+log = logging.getLogger(__name__)
 
 
 def _has_openai_key() -> bool:
@@ -78,11 +81,14 @@ def get_base_args() -> argparse.Namespace:
 def get_collection():
     base = get_base_args()
     if base.no_rag:
+        log.info("get_collection_skip no_rag")
         return None
-    try:
-        return load_collection_from_args(base)
-    except Exception:
-        return None
+    col, reason = load_chroma_collection(base)
+    if col is None:
+        log.warning("get_collection_unavailable reason=%s", reason)
+    else:
+        log.info("get_collection_ok name=%s", base.collection)
+    return col
 
 
 def clone_args_for_request(session_id: str | None, debug: bool) -> argparse.Namespace:

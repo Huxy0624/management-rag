@@ -418,18 +418,84 @@ def ensure_session_id(
     return create_session(title=title, db_path=db_path)
 
 
-def load_collection_from_args(args: argparse.Namespace) -> Any | None:
+def load_chroma_collection(args: argparse.Namespace) -> tuple[Any | None, str | None]:
+    """
+    Open the configured Chroma collection. Returns (collection, None) or (None, reason).
+    Logs path, listed collection names, and failures — use for diagnostics.
+    """
     if args.no_rag:
-        return None
-    if not args.db_dir.exists():
-        return None
+        logger.info("chroma_skip reason=no_rag")
+        return None, "no_rag"
+    d = args.db_dir
+    if not d.exists():
+        logger.warning("chroma_db_dir_missing path=%s", d.resolve())
+        return None, f"db_dir_not_found:{d}"
     try:
         import chromadb
 
-        chroma_client = chromadb.PersistentClient(path=str(args.db_dir))
-        return chroma_client.get_collection(name=args.collection)
-    except Exception:
-        return None
+        client = chromadb.PersistentClient(path=str(d))
+        listed = [c.name for c in client.list_collections()]
+        logger.info("chroma_store path=%s collections=%s", d.resolve(), listed)
+        col = client.get_collection(name=args.collection)
+        logger.info(
+            "chroma_collection_opened name=%s path=%s",
+            args.collection,
+            d.resolve(),
+        )
+        return col, None
+    except Exception as exc:
+        logger.exception(
+            "chroma_collection_open_failed path=%s requested_name=%s",
+            d.resolve(),
+            args.collection,
+        )
+        return None, str(exc)
+
+
+def load_collection_from_args(args: argparse.Namespace) -> Any | None:
+    col, _reason = load_chroma_collection(args)
+    return col
+
+
+def chroma_installation_status(args: argparse.Namespace) -> dict[str, object]:
+    """Structured snapshot for /api/diag/chroma (no retrieval / no embedding calls)."""
+    from embedding_provider import DEFAULT_LOCAL_MODEL, DEFAULT_OPENAI_MODEL
+
+    col, reason = load_chroma_collection(args)
+    emb_model = args.embedding_model
+    if not emb_model:
+        emb_model = DEFAULT_OPENAI_MODEL if args.embedding_provider == "openai" else DEFAULT_LOCAL_MODEL
+    out: dict[str, object] = {
+        "db_dir": str(args.db_dir.resolve()),
+        "db_dir_exists": args.db_dir.exists(),
+        "collection_name_configured": args.collection,
+        "collection_available": col is not None,
+        "unavailable_reason": reason,
+        "embedding_provider_at_query": args.embedding_provider,
+        "embedding_model_at_query": emb_model,
+    }
+    if col is not None:
+        try:
+            out["document_count"] = col.count()
+        except Exception as exc:
+            out["document_count_error"] = str(exc)
+    else:
+        try:
+            import chromadb
+
+            if args.db_dir.exists():
+                client = chromadb.PersistentClient(path=str(args.db_dir))
+                out["collections_in_store"] = [c.name for c in client.list_collections()]
+            else:
+                out["collections_in_store"] = []
+        except Exception as exc:
+            out["collections_in_store"] = []
+            out["list_collections_error"] = str(exc)
+    out["note"] = (
+        "索引若用本地 sentence-transformers 构建，而查询使用 OpenAI embedding，则向量维度/空间不一致，"
+        "query 会失败；需用同一 embedding 方案重建 Chroma。"
+    )
+    return out
 
 
 def _runtime_debug_payload(planner_context: dict[str, object], selection_result: dict[str, object]) -> dict[str, object]:
@@ -661,7 +727,10 @@ def retrieve_chunks_resilient(
     retrieval_query: str,
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, object]], int, str]:
-    """Chroma + OpenAI embedding when possible; otherwise keyword KB fallback. Always returns timing + backend."""
+    """
+    If Chroma collection is open: use Chroma + embedding only (no silent fallback to keyword).
+    If collection is None: use data/kb_chunks.jsonl keyword retrieval only when file exists.
+    """
     chroma_available = collection is not None
     kb_available = kb_jsonl_ready()
     logger.info(
@@ -681,40 +750,23 @@ def retrieve_chunks_resilient(
 
     logger.info("retrieval_start query_preview=%s", (retrieval_query or "")[:120])
     t0 = time.perf_counter()
-    chunks: list[dict[str, object]] = []
-    backend_selected = "keyword_jsonl"
     if collection is not None:
-        try:
-            chunks = retrieve_context(
-                collection=collection,
-                question=retrieval_query,
-                embedding_provider=args.embedding_provider,
-                embedding_model=args.embedding_model,
-                top_k=args.top_k,
-            )
-            backend_selected = "chroma"
-            logger.info(
-                "retrieval_backend_selected=%s hit_count=%s",
-                backend_selected,
-                len(chunks),
-            )
-        except Exception as exc:
-            logger.warning("retrieval_chroma_failed: %s", exc)
-            chunks = keyword_retrieve_fallback(retrieval_query, top_k=args.top_k)
-            backend_selected = "keyword_jsonl"
-            logger.info(
-                "retrieval_backend_selected=%s hit_count=%s (after chroma failure)",
-                backend_selected,
-                len(chunks),
-            )
+        chunks = retrieve_context(
+            collection=collection,
+            question=retrieval_query,
+            embedding_provider=args.embedding_provider,
+            embedding_model=args.embedding_model,
+            top_k=args.top_k,
+        )
+        backend_selected = "chroma"
+        logger.info(
+            "retrieval_final_backend=chroma hit_count=%s (no_keyword_fallback_when_chroma_loaded)",
+            len(chunks),
+        )
     else:
         chunks = keyword_retrieve_fallback(retrieval_query, top_k=args.top_k)
         backend_selected = "keyword_jsonl"
-        logger.info(
-            "retrieval_backend_selected=%s hit_count=%s",
-            backend_selected,
-            len(chunks),
-        )
+        logger.info("retrieval_final_backend=keyword_jsonl hit_count=%s", len(chunks))
     latency_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
         "retrieval_end backend=%s count=%s latency_ms=%s",

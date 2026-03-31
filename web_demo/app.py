@@ -12,7 +12,9 @@ from fastapi.staticfiles import StaticFiles
 from web_demo.admin_service import load_recent_requests
 from web_demo.config import get_demo_config
 from web_demo.feedback_store import save_feedback
-from chat import RetrievalInfrastructureError, retrieve_chunks_resilient
+from embedding_provider import EmbeddingRuntimeError
+
+from chat import RetrievalInfrastructureError, chroma_installation_status, retrieve_chunks_resilient
 from web_demo.schemas import (
     AdminRequestsResponse,
     AskRequest,
@@ -133,6 +135,12 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
     except RetrievalInfrastructureError as exc:
         log.error("ask_retrieval_infrastructure: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except EmbeddingRuntimeError as exc:
+        log.error("ask_embedding_retrieval_failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="向量检索失败：Chroma 索引的嵌入与当前查询嵌入可能不一致，请重建索引或检查 embedding 配置。",
+        ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if not debug_enabled:
@@ -152,6 +160,13 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
     return AskResponse(**result)
 
 
+@app.get("/api/diag/chroma")
+def diag_chroma() -> dict[str, object]:
+    """Report whether db/chroma can be opened and which collections exist (no embedding call)."""
+    args = get_base_args()
+    return chroma_installation_status(args)
+
+
 @app.get("/api/diag/retrieval", response_model=RetrievalDiagResponse)
 def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
     """Run retrieval only (Chroma + OpenAI embed, or keyword JSONL fallback) for smoke tests."""
@@ -168,6 +183,12 @@ def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
     except RetrievalInfrastructureError as exc:
         log.error("diag_retrieval_infrastructure: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except EmbeddingRuntimeError as exc:
+        log.error("diag_retrieval_embedding_failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="向量检索失败：索引嵌入与当前查询嵌入可能不一致，需用相同 embedding 方案重建 Chroma。",
+        ) from exc
     preview = [
         {
             "source": str(dict(c.get("metadata") or {}).get("source", "")),
