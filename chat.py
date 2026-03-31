@@ -30,7 +30,7 @@ from embedding_provider import (
 from rerank import RERANK_CONFIG, build_candidates, rerank_candidates
 from runtime.answer_selector import select_answer
 from runtime.failure_case_logger import detect_failure_case, record_failure_case
-from runtime.keyword_retrieval import keyword_retrieve_fallback
+from runtime.keyword_retrieval import kb_jsonl_ready, keyword_retrieve_fallback
 from runtime.llm_surface_runtime import (
     SurfaceGenerationConfigError,
     SurfaceGenerationRuntimeError,
@@ -57,6 +57,12 @@ CONTEXT_CHAR_LIMIT = 2500
 
 class LLMConfigError(Exception):
     """Raised when the LLM client configuration is invalid."""
+
+
+class RetrievalInfrastructureError(Exception):
+    """Neither Chroma nor data/kb_chunks.jsonl is available for retrieval."""
+
+    pass
 
 
 class LLMRuntimeError(Exception):
@@ -654,11 +660,29 @@ def retrieve_chunks_resilient(
     collection: Any | None,
     retrieval_query: str,
     args: argparse.Namespace,
-) -> tuple[list[dict[str, object]], int]:
-    """Chroma + OpenAI embedding when possible; otherwise keyword KB fallback. Always returns timing."""
+) -> tuple[list[dict[str, object]], int, str]:
+    """Chroma + OpenAI embedding when possible; otherwise keyword KB fallback. Always returns timing + backend."""
+    chroma_available = collection is not None
+    kb_available = kb_jsonl_ready()
+    logger.info(
+        "retrieval_resources chroma_collection_available=%s kb_jsonl_found=%s",
+        chroma_available,
+        kb_available,
+    )
+    if not chroma_available and not kb_available:
+        logger.error(
+            "retrieval_aborted_no_backend chroma=%s kb_jsonl=%s",
+            chroma_available,
+            kb_available,
+        )
+        raise RetrievalInfrastructureError(
+            "知识库未就绪：未检测到可用的向量库（db/chroma），且未找到 data/kb_chunks.jsonl。"
+        )
+
     logger.info("retrieval_start query_preview=%s", (retrieval_query or "")[:120])
     t0 = time.perf_counter()
     chunks: list[dict[str, object]] = []
+    backend_selected = "keyword_jsonl"
     if collection is not None:
         try:
             chunks = retrieve_context(
@@ -668,17 +692,37 @@ def retrieve_chunks_resilient(
                 embedding_model=args.embedding_model,
                 top_k=args.top_k,
             )
-            logger.info("retrieval_chroma_ok count=%s", len(chunks))
+            backend_selected = "chroma"
+            logger.info(
+                "retrieval_backend_selected=%s hit_count=%s",
+                backend_selected,
+                len(chunks),
+            )
         except Exception as exc:
             logger.warning("retrieval_chroma_failed: %s", exc)
             chunks = keyword_retrieve_fallback(retrieval_query, top_k=args.top_k)
-            logger.info("retrieval_keyword_after_chroma_fail count=%s", len(chunks))
+            backend_selected = "keyword_jsonl"
+            logger.info(
+                "retrieval_backend_selected=%s hit_count=%s (after chroma failure)",
+                backend_selected,
+                len(chunks),
+            )
     else:
         chunks = keyword_retrieve_fallback(retrieval_query, top_k=args.top_k)
-        logger.info("retrieval_keyword_only count=%s", len(chunks))
+        backend_selected = "keyword_jsonl"
+        logger.info(
+            "retrieval_backend_selected=%s hit_count=%s",
+            backend_selected,
+            len(chunks),
+        )
     latency_ms = int((time.perf_counter() - t0) * 1000)
-    logger.info("retrieval_end count=%s latency_ms=%s", len(chunks), latency_ms)
-    return chunks, latency_ms
+    logger.info(
+        "retrieval_end backend=%s count=%s latency_ms=%s",
+        backend_selected,
+        len(chunks),
+        latency_ms,
+    )
+    return chunks, latency_ms, backend_selected
 
 
 def generate_minimal_rag_answer(
@@ -968,6 +1012,7 @@ def answer_single_turn_payload(
             "retrieval_query": None,
             "retrieval_count": 0,
             "retrieval_latency_ms": 0,
+            "retrieval_backend": None,
             "debug_info": debug_info,
             "selected_from": "clarification",
             "fallback_triggered": False,
@@ -975,17 +1020,16 @@ def answer_single_turn_payload(
             "clarification_question": clarification_question,
             "generation_trace": generation_trace,
         }
-    if not args.no_rag:
-        if collection is None:
-            raise ValueError("Collection is not available while RAG mode is enabled.")
-        chunks = retrieve_context(
-            collection=collection,
-            question=retrieval_query,
-            embedding_provider=args.embedding_provider,
-            embedding_model=args.embedding_model,
-            top_k=args.top_k,
+    retrieval_backend: str | None = None
+    if args.no_rag:
+        chunks = []
+        retrieval_latency_ms = 0
+    else:
+        chunks, retrieval_latency_ms, retrieval_backend = retrieve_chunks_resilient(
+            collection,
+            retrieval_query,
+            args,
         )
-    retrieval_latency_ms = int((time.perf_counter() - retrieval_started) * 1000)
 
     if not args.no_rag:
         context_length = sum(len(str(chunk["document"])) for chunk in chunks)
@@ -1133,6 +1177,7 @@ def answer_single_turn_payload(
             "question_diagnosis": diagnosis_result,
             "generation_chain_v2_enabled": use_full_chain,
             "minimal_rag_mode": use_minimal_rag,
+            "retrieval_backend": retrieval_backend,
             "retrieval_count": len(chunks),
             "retrieval_latency_ms": retrieval_latency_ms,
             "failure_logged": failure_logged,
@@ -1172,6 +1217,7 @@ def answer_single_turn_payload(
         "retrieval_query": retrieval_query,
         "retrieval_count": len(chunks),
         "retrieval_latency_ms": retrieval_latency_ms,
+        "retrieval_backend": retrieval_backend,
         "debug_info": debug_info,
         "selected_from": debug_info.get("selected_from"),
         "fallback_triggered": bool(debug_info.get("fallback_triggered", False)),

@@ -24,6 +24,7 @@ class AskResponse(BaseModel):
     retrieval_query: str | None = None
     retrieval_count: int = 0
     retrieval_latency_ms: int = 0
+    retrieval_backend: str | None = None
     selected_from: str | None = None
     fallback_triggered: bool = False
     needs_clarification: bool = False

@@ -14,6 +14,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_KEYWORD_KB_PATH = Path("data/kb_chunks.jsonl")
 
 
+def kb_jsonl_ready(path: Path | None = None) -> bool:
+    """True if the keyword KB file exists and is non-empty (deployment smoke check)."""
+    p = path or DEFAULT_KEYWORD_KB_PATH
+    try:
+        return p.is_file() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _load_kb_documents(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         logger.info("keyword_kb_missing path=%s", path)

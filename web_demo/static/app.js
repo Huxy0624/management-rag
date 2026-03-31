@@ -191,6 +191,7 @@ function renderResponse(data) {
     ["retrieval_query", data.retrieval_query || retrieval.query || debug.retrieval_query || data.question],
     ["retrieval_count", String(data.retrieval_count ?? "-")],
     ["retrieval_latency_ms", String(data.retrieval_latency_ms ?? debug.timings_ms?.retrieval ?? "-")],
+    ["retrieval_backend", data.retrieval_backend || debug.retrieval_backend || "-"],
     ["planning_query", debug.planning_query || "-"]
   ]);
 
@@ -324,14 +325,20 @@ async function askQuestion() {
     });
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      console.error("[Ask] HTTP error:", response.status, text);
+      answerText.textContent =
+        response.status === 503
+          ? "知识库未就绪，暂时无法回答。（详细原因见浏览器控制台）"
+          : "服务暂时不可用，请稍后重试。（详细原因见浏览器控制台）";
+      requestStatus.textContent = "Failed.";
+      return;
     }
     const data = await response.json();
     renderResponse(data);
     requestStatus.textContent = "Done.";
   } catch (error) {
-    console.log("[Ask] fetch error:", error?.message || error);
-    answerText.textContent = `Error: ${error.message}`;
+    console.error("[Ask] fetch error:", error?.message || error);
+    answerText.textContent = "请求失败，请稍后重试。（详细原因见浏览器控制台）";
     requestStatus.textContent = "Failed.";
   } finally {
     askButton.disabled = false;

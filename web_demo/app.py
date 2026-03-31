@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 import time
 from collections import defaultdict, deque
 
@@ -11,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from web_demo.admin_service import load_recent_requests
 from web_demo.config import get_demo_config
 from web_demo.feedback_store import save_feedback
-from chat import retrieve_chunks_resilient
+from chat import RetrievalInfrastructureError, retrieve_chunks_resilient
 from web_demo.schemas import (
     AdminRequestsResponse,
     AskRequest,
@@ -30,7 +31,7 @@ STATIC_DIR = BASE_DIR / "static"
 INDEX_FILE = BASE_DIR / "index.html"
 ADMIN_FILE = BASE_DIR / "admin.html"
 RATE_LIMIT_HISTORY: dict[str, deque[float]] = defaultdict(deque)
-
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="TraceAnswer Demo", version="0.1.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -129,6 +130,9 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
             client_ip=_client_ip(request),
             user_mode=user_mode,
         )
+    except RetrievalInfrastructureError as exc:
+        log.error("ask_retrieval_infrastructure: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if not debug_enabled:
@@ -143,6 +147,7 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
             "retrieval_query": result.get("retrieval_query"),
             "retrieval_count": result.get("retrieval_count"),
             "retrieval_latency_ms": result.get("retrieval_latency_ms"),
+            "retrieval_backend": result.get("retrieval_backend"),
         }
     return AskResponse(**result)
 
@@ -158,8 +163,11 @@ def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter q is required.")
     collection = get_collection()
-    chunks, latency_ms = retrieve_chunks_resilient(collection, query, args)
-    backend = "chroma" if collection is not None else "keyword_jsonl"
+    try:
+        chunks, latency_ms, backend = retrieve_chunks_resilient(collection, query, args)
+    except RetrievalInfrastructureError as exc:
+        log.error("diag_retrieval_infrastructure: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     preview = [
         {
             "source": str(dict(c.get("metadata") or {}).get("source", "")),
