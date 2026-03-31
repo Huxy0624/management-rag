@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -29,15 +30,18 @@ from embedding_provider import (
 from rerank import RERANK_CONFIG, build_candidates, rerank_candidates
 from runtime.answer_selector import select_answer
 from runtime.failure_case_logger import detect_failure_case, record_failure_case
+from runtime.keyword_retrieval import keyword_retrieve_fallback
 from runtime.llm_surface_runtime import (
     SurfaceGenerationConfigError,
     SurfaceGenerationRuntimeError,
     generate_surface_answer,
+    request_llm_answer,
 )
 from runtime.planner_runtime import build_planner_context
 from runtime.question_diagnoser import diagnose_question
 from runtime.runtime_config import runtime_config_from_args
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_DIR = Path("db/chroma")
 DEFAULT_COLLECTION = "management_rag"
@@ -132,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--runtime-profile",
-        choices=["local_dev", "staging", "production", "render_lite"],
+        choices=["local_dev", "staging", "production", "render_lite", "minimal_rag"],
         help="Runtime profile for v3 defaults. Falls back to GENERATION_RUNTIME_PROFILE.",
     )
     parser.add_argument(
@@ -646,6 +650,116 @@ def _as_llm_runtime_error(exc: Exception, *, context_length: int = 0) -> LLMRunt
     )
 
 
+def retrieve_chunks_resilient(
+    collection: Any | None,
+    retrieval_query: str,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, object]], int]:
+    """Chroma + OpenAI embedding when possible; otherwise keyword KB fallback. Always returns timing."""
+    logger.info("retrieval_start query_preview=%s", (retrieval_query or "")[:120])
+    t0 = time.perf_counter()
+    chunks: list[dict[str, object]] = []
+    if collection is not None:
+        try:
+            chunks = retrieve_context(
+                collection=collection,
+                question=retrieval_query,
+                embedding_provider=args.embedding_provider,
+                embedding_model=args.embedding_model,
+                top_k=args.top_k,
+            )
+            logger.info("retrieval_chroma_ok count=%s", len(chunks))
+        except Exception as exc:
+            logger.warning("retrieval_chroma_failed: %s", exc)
+            chunks = keyword_retrieve_fallback(retrieval_query, top_k=args.top_k)
+            logger.info("retrieval_keyword_after_chroma_fail count=%s", len(chunks))
+    else:
+        chunks = keyword_retrieve_fallback(retrieval_query, top_k=args.top_k)
+        logger.info("retrieval_keyword_only count=%s", len(chunks))
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    logger.info("retrieval_end count=%s latency_ms=%s", len(chunks), latency_ms)
+    return chunks, latency_ms
+
+
+def generate_minimal_rag_answer(
+    question: str,
+    chunks: list[dict[str, object]],
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    """Single OpenAI call grounded on retrieved chunks (no planner / control / rewrite)."""
+    runtime_config = args.runtime_config
+    surface = runtime_config.surface
+    gen_started = time.perf_counter()
+    logger.info("generation_start mode=minimal_rag chunks=%s", len(chunks))
+    try:
+        if not chunks:
+            system = (
+                "你是管理实践与组织协作方向的助手。"
+                "当前检索未命中任何知识库片段。请明确说明：未检索到相关片段；"
+                "然后给出不超过三句的通用建议，不要编造具体文档或事实。"
+            )
+            user_text = f"用户问题：\n{question}"
+            answer, _usage, retry_count = request_llm_answer(system, user_text, surface, 0.35)
+            prompt_combined = f"{system}\n\n{user_text}"
+        else:
+            context_text, _original_context_length, _final_context_length, used_chunks = build_context_with_limit(
+                chunks=chunks,
+                char_limit=args.context_char_limit,
+            )
+            source_text = format_sources(used_chunks)
+            system = (
+                "你是RAG问答助手。必须严格依据下方「检索片段」回答，不得编造片段中不存在的事实。"
+                "若片段不足以回答，请说明依据不足，并引用片段中能支持的部分。"
+                "回答末尾用「来源：」列出片段来源。"
+            )
+            user_text = (
+                f"问题：\n{question}\n\n"
+                f"检索片段：\n{context_text}\n\n"
+                f"可引用来源：\n{source_text}"
+            )
+            answer, _usage, retry_count = request_llm_answer(system, user_text, surface, 0.35)
+            prompt_combined = f"{system}\n\n{user_text}"
+    except SurfaceGenerationRuntimeError as exc:
+        raise _as_llm_runtime_error(exc) from exc
+    gen_ms = int((time.perf_counter() - gen_started) * 1000)
+    logger.info("generation_end mode=minimal_rag latency_ms=%s", gen_ms)
+    debug_payload: dict[str, object] = {
+        "selected_from": "minimal_rag_openai",
+        "planner_output_v2": None,
+        "planner_output_v21": None,
+        "router_decision": None,
+        "selected_evidence": {
+            "main_evidence": build_source_items(chunks, limit=args.top_k),
+            "support_evidence": [],
+            "role_conflict_notes": [],
+        },
+        "query_type": "minimal_rag",
+        "fallback_triggered": False,
+        "rewrite_triggered": False,
+    }
+    return {
+        "answer": answer,
+        "prompt_text": prompt_combined,
+        "prompt_length": len(prompt_combined),
+        "latency_ms": gen_ms,
+        "retry_count": retry_count,
+        "provider": "openai",
+        "model_name": surface.model_name,
+        "debug_payload": debug_payload,
+        "timings_ms": {
+            "planner": 0,
+            "generation": gen_ms,
+            "rewrite": 0,
+            "total": gen_ms,
+        },
+        "log_metadata": {
+            "runtime_path": "minimal_rag_openai",
+            "runtime_profile": runtime_config.metadata.profile_name,
+            "selected_from": "minimal_rag_openai",
+        },
+    }
+
+
 def generate_answer_v3_runtime(
     question: str,
     chunks: list[dict[str, object]],
@@ -761,7 +875,9 @@ def answer_single_turn_payload(
 ) -> dict[str, object]:
     runtime_config = args.runtime_config
     flags = runtime_config.feature_flags
-    use_generation_chain_v2 = bool(flags.enable_generation_chain_v2 and flags.enable_llm_surface_generation_v3)
+    use_full_chain = bool(flags.enable_generation_chain_v2 and flags.enable_llm_surface_generation_v3)
+    use_minimal_rag = bool(flags.enable_llm_surface_generation_v3 and not flags.enable_generation_chain_v2)
+    use_generation_chain_v2 = use_full_chain
     request_started = time.perf_counter()
     request_id = str(uuid4())
     session_id = ensure_session_id(args.session_id, question)
@@ -778,11 +894,11 @@ def answer_single_turn_payload(
     diagnosis_result: dict[str, object] | None = None
     retrieval_rewrites: list[str] = []
     retrieval_query = question
-    if use_generation_chain_v2:
+    if use_full_chain:
         diagnosis_result = diagnose_question(question, runtime_config.surface)
         retrieval_rewrites = list(diagnosis_result.get("rewrite_for_retrieval", []))
         retrieval_query = str(retrieval_rewrites[0]).strip() if retrieval_rewrites else question
-    if use_generation_chain_v2 and diagnosis_result and bool(diagnosis_result.get("needs_clarification")):
+    if use_full_chain and diagnosis_result and bool(diagnosis_result.get("needs_clarification")):
         clarification_question = str(diagnosis_result.get("clarification_question", "")).strip() or "为了给你更准确的建议，我需要先确认一下你的角色。"
         add_generation_log(
             session_id=session_id,
@@ -848,6 +964,10 @@ def answer_single_turn_payload(
             "answer": clarification_question,
             "sources": [],
             "source_text": "",
+            "retrieved_chunks": [],
+            "retrieval_query": None,
+            "retrieval_count": 0,
+            "retrieval_latency_ms": 0,
             "debug_info": debug_info,
             "selected_from": "clarification",
             "fallback_triggered": False,
@@ -881,12 +1001,18 @@ def answer_single_turn_payload(
         )
 
     try:
-        if use_generation_chain_v2:
+        if use_full_chain:
             generation_result = generate_answer_v3_runtime(
                 question=question,
                 chunks=chunks,
                 args=args,
                 diagnosis_result=diagnosis_result,
+            )
+        elif use_minimal_rag:
+            generation_result = generate_minimal_rag_answer(
+                question=question,
+                chunks=chunks,
+                args=args,
             )
         else:
             generation_result = generate_answer(
@@ -905,9 +1031,9 @@ def answer_single_turn_payload(
         add_generation_log(
             session_id=session_id,
             message_id=user_message_id,
-            provider="openai" if use_generation_chain_v2 else "ollama",
+            provider="openai" if (use_full_chain or use_minimal_rag) else "ollama",
             model_name=runtime_config.surface.model_name
-            if use_generation_chain_v2
+            if (use_full_chain or use_minimal_rag)
             else args.llm_model,
             prompt_text=exc.prompt_text,
             prompt_length=exc.prompt_length,
@@ -917,7 +1043,11 @@ def answer_single_turn_payload(
             success=False,
             error_message=str(exc),
             metadata_json={
-                "runtime_path": "planner_v21_llm_v3" if use_generation_chain_v2 else "legacy_ollama",
+                "runtime_path": (
+                    "minimal_rag_openai"
+                    if use_minimal_rag
+                    else ("planner_v21_llm_v3" if use_full_chain else "legacy_ollama")
+                ),
                 "runtime_profile": runtime_config.metadata.profile_name,
                 "request_id": request_id,
             },
@@ -927,7 +1057,7 @@ def answer_single_turn_payload(
     answer = str(generation_result["answer"])
     failure_logged = False
     failure_type: str | None = None
-    if use_generation_chain_v2:
+    if use_full_chain:
         debug_payload_for_failure = dict(generation_result.get("debug_payload", {}))
         failure_type, failure_notes = detect_failure_case(
             original_query=question,
@@ -1001,7 +1131,10 @@ def answer_single_turn_payload(
             "retrieval_query": retrieval_query,
             "reasoning_rewrite": list((diagnosis_result or {}).get("rewrite_for_reasoning", [])),
             "question_diagnosis": diagnosis_result,
-            "generation_chain_v2_enabled": use_generation_chain_v2,
+            "generation_chain_v2_enabled": use_full_chain,
+            "minimal_rag_mode": use_minimal_rag,
+            "retrieval_count": len(chunks),
+            "retrieval_latency_ms": retrieval_latency_ms,
             "failure_logged": failure_logged,
             "failure_type": failure_type,
             "timings_ms": {
@@ -1027,6 +1160,7 @@ def answer_single_turn_payload(
         failure_type=failure_type,
     )
 
+    retrieved_chunks = build_source_items(chunks, limit=max(20, args.top_k))
     return {
         "request_id": request_id,
         "session_id": session_id,
@@ -1034,6 +1168,10 @@ def answer_single_turn_payload(
         "answer": answer,
         "sources": build_source_items(chunks, limit=args.top_k),
         "source_text": format_sources(chunks),
+        "retrieved_chunks": retrieved_chunks,
+        "retrieval_query": retrieval_query,
+        "retrieval_count": len(chunks),
+        "retrieval_latency_ms": retrieval_latency_ms,
         "debug_info": debug_info,
         "selected_from": debug_info.get("selected_from"),
         "fallback_triggered": bool(debug_info.get("fallback_triggered", False)),

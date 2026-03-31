@@ -20,10 +20,23 @@ class AskResponse(BaseModel):
     sources: list[dict[str, Any]]
     debug_info: dict[str, Any]
     generation_trace: dict[str, Any]
+    retrieved_chunks: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_query: str | None = None
+    retrieval_count: int = 0
+    retrieval_latency_ms: int = 0
     selected_from: str | None = None
     fallback_triggered: bool = False
     needs_clarification: bool = False
     clarification_question: str | None = None
+
+
+class RetrievalDiagResponse(BaseModel):
+    ok: bool
+    retrieval_query: str
+    chunk_count: int
+    latency_ms: int
+    backend: str
+    chunks: list[dict[str, Any]]
 
 
 class HealthResponse(BaseModel):

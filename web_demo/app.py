@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from web_demo.admin_service import load_recent_requests
 from web_demo.config import get_demo_config
 from web_demo.feedback_store import save_feedback
+from chat import retrieve_chunks_resilient
 from web_demo.schemas import (
     AdminRequestsResponse,
     AskRequest,
@@ -19,8 +20,9 @@ from web_demo.schemas import (
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
+    RetrievalDiagResponse,
 )
-from web_demo.service import ask_question, get_base_args
+from web_demo.service import ask_question, get_base_args, get_collection
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -135,10 +137,46 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
             "session_id": result["session_id"],
             "selected_from": result.get("selected_from"),
             "generation_chain_v2_enabled": dict(result.get("debug_info", {})).get("generation_chain_v2_enabled"),
+            "minimal_rag_mode": dict(result.get("debug_info", {})).get("minimal_rag_mode"),
             "fallback_triggered": result.get("fallback_triggered", False),
             "timings_ms": dict(result.get("debug_info", {}).get("timings_ms", {})),
+            "retrieval_query": result.get("retrieval_query"),
+            "retrieval_count": result.get("retrieval_count"),
+            "retrieval_latency_ms": result.get("retrieval_latency_ms"),
         }
     return AskResponse(**result)
+
+
+@app.get("/api/diag/retrieval", response_model=RetrievalDiagResponse)
+def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
+    """Run retrieval only (Chroma + OpenAI embed, or keyword JSONL fallback) for smoke tests."""
+    _enforce_rate_limit(request)
+    args = get_base_args()
+    if args.no_rag:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is required for retrieval.")
+    query = (q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query parameter q is required.")
+    collection = get_collection()
+    chunks, latency_ms = retrieve_chunks_resilient(collection, query, args)
+    backend = "chroma" if collection is not None else "keyword_jsonl"
+    preview = [
+        {
+            "source": str(dict(c.get("metadata") or {}).get("source", "")),
+            "chunk_id": dict(c.get("metadata") or {}).get("chunk_id"),
+            "preview": (str(c.get("document", ""))[:400]),
+            "rerank_score": c.get("rerank_score"),
+        }
+        for c in chunks[:10]
+    ]
+    return RetrievalDiagResponse(
+        ok=True,
+        retrieval_query=query,
+        chunk_count=len(chunks),
+        latency_ms=latency_ms,
+        backend=backend,
+        chunks=preview,
+    )
 
 
 @app.post("/api/feedback", response_model=FeedbackResponse)

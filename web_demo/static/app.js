@@ -105,10 +105,15 @@ function renderKeyValues(container, pairs) {
   });
 }
 
-function renderSources(sources) {
+function renderSources(sources, retrievalCount) {
   sourcesList.innerHTML = "";
+  const n = typeof retrievalCount === "number" ? retrievalCount : sources?.length ?? 0;
   if (!sources || sources.length === 0) {
-    sourcesList.textContent = "No retrieved chunks.";
+    const msg =
+      n === 0
+        ? "检索未命中：知识库中未返回任何 chunk（请确认 db/chroma 已部署或 data/kb_chunks.jsonl 存在）。"
+        : "No retrieved chunks.";
+    sourcesList.textContent = msg;
     return;
   }
 
@@ -152,7 +157,11 @@ function traceOrFallback(data) {
 
 function renderResponse(data) {
   answerText.textContent = data.answer || "";
-  renderSources(data.sources || []);
+  const chunkList =
+    data.retrieved_chunks && data.retrieved_chunks.length > 0
+      ? data.retrieved_chunks
+      : data.sources || [];
+  renderSources(chunkList, data.retrieval_count);
   if (data.needs_clarification) {
     hideFeedback();
   } else {
@@ -177,8 +186,11 @@ function renderResponse(data) {
     ["request_id", data.request_id],
     ["session_id", data.session_id],
     ["generation_chain_v2", String(debug.generation_chain_v2_enabled)],
+    ["minimal_rag", String(Boolean(debug.minimal_rag_mode))],
     ["query_type", diagnosis.question_type || debug.query_type],
-    ["retrieval_query", retrieval.query || debug.retrieval_query || data.question],
+    ["retrieval_query", data.retrieval_query || retrieval.query || debug.retrieval_query || data.question],
+    ["retrieval_count", String(data.retrieval_count ?? "-")],
+    ["retrieval_latency_ms", String(data.retrieval_latency_ms ?? debug.timings_ms?.retrieval ?? "-")],
     ["planning_query", debug.planning_query || "-"]
   ]);
 

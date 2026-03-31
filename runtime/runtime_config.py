@@ -82,6 +82,15 @@ RUNTIME_PROFILES: dict[str, RuntimeProfileDefaults] = {
         enable_failure_case_logger=False,
         debug_return_intermediate=False,
     ),
+    "minimal_rag": RuntimeProfileDefaults(
+        enable_generation_chain_v2=False,
+        enable_llm_surface_generation_v3=True,
+        enable_control_checks=False,
+        enable_rewrite_v3=False,
+        enable_fallback_v21=False,
+        enable_failure_case_logger=False,
+        debug_return_intermediate=False,
+    ),
 }
 
 
