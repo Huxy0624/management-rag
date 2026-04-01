@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from typing import Any
 from functools import lru_cache
 from uuid import uuid4
 
@@ -16,7 +17,7 @@ from chat import (
     OLLAMA_MAX_RETRIES,
     OLLAMA_READ_TIMEOUT_SECONDS,
     answer_single_turn_payload,
-    load_chroma_collection,
+    load_collection_from_args,
 )
 from embedding_provider import DEFAULT_EMBEDDING_PROVIDER
 from runtime.runtime_config import runtime_config_from_args
@@ -78,16 +79,15 @@ def get_base_args() -> argparse.Namespace:
 
 
 @lru_cache(maxsize=1)
-def get_collection():
+def get_chroma_collection_state() -> tuple[Any | None, str | None]:
+    """Cached (collection, reason) from load_collection_from_args; reason is always set when collection is None."""
     base = get_base_args()
-    if base.no_rag:
-        log.info("get_collection_skip no_rag")
-        return None
-    col, reason = load_chroma_collection(base)
-    if col is None:
-        log.warning("get_collection_unavailable reason=%s", reason)
-    else:
-        log.info("get_collection_ok name=%s", base.collection)
+    return load_collection_from_args(base)
+
+
+def get_collection():
+    """Return collection or None. Load reason is discarded; use get_chroma_collection_state() for diagnostics."""
+    col, _reason = get_chroma_collection_state()
     return col
 
 
@@ -125,9 +125,14 @@ def ask_question(
         return result
 
     args = clone_args_for_request(session_id=session_id, debug=debug)
-    collection = get_collection()
+    collection, chroma_reason = get_chroma_collection_state()
 
-    result = answer_single_turn_payload(collection=collection, question=question, args=args)
+    result = answer_single_turn_payload(
+        collection=collection,
+        question=question,
+        args=args,
+        chroma_load_reason=chroma_reason,
+    )
 
     debug_info = dict(result.get("debug_info", {}))
     total_latency_ms = int(dict(debug_info.get("timings_ms", {})).get("total", 0))

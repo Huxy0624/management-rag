@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from runtime.output_language import answer_language_suffix
 from runtime.runtime_config import SurfaceRuntimeConfig
 
 
@@ -130,10 +131,12 @@ def build_surface_payload(
     planner_output: dict[str, Any],
     diagnosis_result: dict[str, Any] | None = None,
     planner_meta: dict[str, Any] | None = None,
+    output_language: str = "zh",
 ) -> dict[str, Any]:
     return {
         "query": query,
         "query_type": query_type,
+        "output_language": output_language,
         "question_diagnosis": diagnosis_result or {},
         "planner_meta": planner_meta or {},
         "planner_output": planner_output,
@@ -215,10 +218,17 @@ def generate_surface_answer(
     config: SurfaceRuntimeConfig,
     diagnosis_result: dict[str, Any] | None = None,
     planner_meta: dict[str, Any] | None = None,
+    output_language: str = "zh",
 ) -> dict[str, Any]:
     prompt_text = load_prompt(config.prompt_path)
-    payload = build_surface_payload(query, query_type, planner_output, diagnosis_result, planner_meta)
-    user_text = "请严格根据以下 JSON 输入生成答案，只输出答案正文，不要解释你的做法。\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    payload = build_surface_payload(
+        query, query_type, planner_output, diagnosis_result, planner_meta, output_language=output_language
+    )
+    user_text = (
+        "请严格根据以下 JSON 输入生成答案，只输出答案正文，不要解释你的做法。\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + answer_language_suffix(output_language)
+    )
     started = time.perf_counter()
     answer, usage, retry_count = request_llm_answer(prompt_text, user_text, config=config, temperature=0.2)
     return {

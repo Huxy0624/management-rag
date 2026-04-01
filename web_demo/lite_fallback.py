@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from chat import add_generation_log, add_message, empty_generation_trace, ensure_session_id, get_next_turn_index
+from runtime.output_language import ENGLISH_ANSWER_GUIDANCE, infer_output_language
 
 NO_OPENAI_KEY_ANSWER = (
     "当前演示需要配置有效的 OPENAI_API_KEY 后才能生成回答。"
@@ -62,6 +63,9 @@ def no_openai_key_response(
     if debug:
         debug_info["reason"] = "OPENAI_API_KEY is not set"
 
+    ol = infer_output_language(question)
+    debug_info["output_language"] = ol
+
     return {
         "request_id": request_id,
         "session_id": session_id_resolved,
@@ -74,6 +78,9 @@ def no_openai_key_response(
         "retrieval_count": 0,
         "retrieval_latency_ms": 0,
         "retrieval_backend": None,
+        "retrieval_status": "collection_unavailable",
+        "retrieval_reason": "no_openai_key",
+        "output_language": ol,
         "debug_info": debug_info,
         "selected_from": "no_openai_key",
         "fallback_triggered": False,
@@ -111,15 +118,23 @@ def openai_completion_fallback_response(
         content=question,
         turn_index=turn_index,
     )
+    ol_fb = infer_output_language(question)
 
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     timeout = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
     client = _client()
-    system = (
-        "你是一名管理实践与组织协作方向的助手。"
-        "请用清晰、可执行的中文回答用户问题。"
-        "若缺少关键信息，可先简要说明假设再给出建议。"
-    )
+    if ol_fb == "en":
+        system = (
+            "You are an assistant on management practice and cross-team collaboration. "
+            "Answer clearly and concretely in English. If key information is missing, state brief assumptions first.\n"
+            + ENGLISH_ANSWER_GUIDANCE
+        )
+    else:
+        system = (
+            "你是一名管理实践与组织协作方向的助手。"
+            "请用清晰、可执行的中文回答用户问题。"
+            "若缺少关键信息，可先简要说明假设再给出建议。"
+        )
     t0 = time.perf_counter()
     try:
         response = client.chat.completions.create(
@@ -209,6 +224,8 @@ def openai_completion_fallback_response(
     if debug and prior_error:
         debug_info["prior_pipeline_error"] = prior_error
 
+    debug_info["output_language"] = ol_fb
+
     return {
         "request_id": request_id,
         "session_id": session_id_resolved,
@@ -221,6 +238,9 @@ def openai_completion_fallback_response(
         "retrieval_count": 0,
         "retrieval_latency_ms": 0,
         "retrieval_backend": None,
+        "retrieval_status": None,
+        "retrieval_reason": None,
+        "output_language": ol_fb,
         "debug_info": debug_info,
         "selected_from": "lite_openai_completion_fallback",
         "fallback_triggered": True,

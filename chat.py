@@ -30,12 +30,17 @@ from embedding_provider import (
 from rerank import RERANK_CONFIG, build_candidates, rerank_candidates
 from runtime.answer_selector import select_answer
 from runtime.failure_case_logger import detect_failure_case, record_failure_case
-from runtime.keyword_retrieval import kb_jsonl_ready, keyword_retrieve_fallback
 from runtime.llm_surface_runtime import (
     SurfaceGenerationConfigError,
     SurfaceGenerationRuntimeError,
     generate_surface_answer,
     request_llm_answer,
+)
+from runtime.kb_source_policy import filter_chunks_for_user_facing
+from runtime.output_language import (
+    ENGLISH_ANSWER_GUIDANCE,
+    ZH_MINIMAL_TAIL,
+    infer_output_language,
 )
 from runtime.planner_runtime import build_planner_context
 from runtime.question_diagnoser import diagnose_question
@@ -53,6 +58,46 @@ OLLAMA_READ_TIMEOUT_SECONDS = 120
 OLLAMA_MAX_RETRIES = 2
 OLLAMA_RETRY_DELAY_SECONDS = 4
 CONTEXT_CHAR_LIMIT = 2500
+
+OUT_OF_SCOPE_REJECTION_MESSAGE = "该问题超出知识库范围，暂不支持回答。"
+
+COLLECTION_UNAVAILABLE_MESSAGE = (
+    "知识库暂不可用，无法基于检索回答问题。请稍后再试或联系管理员。"
+)
+
+
+def build_retrieval_fields(
+    *,
+    no_rag: bool,
+    collection: Any | None,
+    chroma_load_reason: str | None,
+    retrieval_backend: str | None,
+    chunk_count: int,
+) -> tuple[str, str | None, str | None]:
+    """
+    Returns (retrieval_status, retrieval_backend, retrieval_reason) for API/debugging.
+
+    retrieval_status: ok | collection_unavailable | out_of_scope
+    """
+    if no_rag:
+        return (
+            "collection_unavailable",
+            None,
+            chroma_load_reason or "no_rag",
+        )
+    if collection is None or retrieval_backend == "collection_unavailable":
+        return (
+            "collection_unavailable",
+            retrieval_backend or "collection_unavailable",
+            chroma_load_reason or "collection_unavailable",
+        )
+    if chunk_count == 0:
+        return (
+            "out_of_scope",
+            retrieval_backend,
+            "no_valid_chunks_after_filter",
+        )
+    return ("ok", retrieval_backend, None)
 
 
 class LLMConfigError(Exception):
@@ -452,16 +497,30 @@ def load_chroma_collection(args: argparse.Namespace) -> tuple[Any | None, str | 
         return None, str(exc)
 
 
-def load_collection_from_args(args: argparse.Namespace) -> Any | None:
-    col, _reason = load_chroma_collection(args)
-    return col
+def load_collection_from_args(args: argparse.Namespace) -> tuple[Any | None, str | None]:
+    """
+    Open the configured Chroma collection using the same rules as load_chroma_collection.
+
+    Always returns (collection, reason). On success, reason is None.
+    On failure or skip, collection is None and reason is never omitted — e.g. no_rag,
+    db_dir_not_found:..., or the exception message from opening the collection.
+    """
+    col, reason = load_chroma_collection(args)
+    if col is None:
+        if reason == "no_rag":
+            logger.info("load_collection_from_args skipped reason=no_rag")
+        else:
+            logger.warning("load_collection_from_args failed reason=%s", reason)
+    else:
+        logger.info("load_collection_from_args ok collection=%s", args.collection)
+    return col, reason
 
 
 def chroma_installation_status(args: argparse.Namespace) -> dict[str, object]:
     """Structured snapshot for /api/diag/chroma (no retrieval / no embedding calls)."""
     from embedding_provider import DEFAULT_LOCAL_MODEL, DEFAULT_OPENAI_MODEL
 
-    col, reason = load_chroma_collection(args)
+    col, reason = load_collection_from_args(args)
     emb_model = args.embedding_model
     if not emb_model:
         emb_model = DEFAULT_OPENAI_MODEL if args.embedding_provider == "openai" else DEFAULT_LOCAL_MODEL
@@ -519,6 +578,7 @@ def _runtime_debug_payload(planner_context: dict[str, object], selection_result:
         "diagnosis_fail_reason": final_checks.get("diagnosis_fail_reason"),
         "rewrite_triggered": selection_result.get("rewrite_triggered", False),
         "fallback_triggered": selection_result.get("fallback_triggered", False),
+        "output_language": planner_context.get("output_language", "zh"),
     }
 
 
@@ -595,6 +655,7 @@ def _empty_generation_trace() -> dict[str, object]:
         "final_output": {
             "final_answer": "",
         },
+        "rejection_reason": None,
     }
 
 
@@ -611,6 +672,7 @@ def _build_generation_trace(
     final_answer: str,
     failure_logged: bool = False,
     failure_type: str | None = None,
+    rejection_reason: str | None = None,
 ) -> dict[str, object]:
     trace = _empty_generation_trace()
     diagnosis = dict(diagnosis_result or {})
@@ -671,6 +733,7 @@ def _build_generation_trace(
     trace["final_output"] = {
         "final_answer": final_answer,
     }
+    trace["rejection_reason"] = rejection_reason
     return trace
 
 
@@ -728,29 +791,28 @@ def retrieve_chunks_resilient(
     args: argparse.Namespace,
 ) -> tuple[list[dict[str, object]], int, str]:
     """
-    If Chroma collection is open: use Chroma + embedding only (no silent fallback to keyword).
-    If collection is None: use data/kb_chunks.jsonl keyword retrieval only when file exists.
+    Strict RAG: only Chroma retrieval when a collection is open.
+    If collection is None: return empty chunks (no JSONL / keyword fallback in user-facing retrieval).
     """
-    chroma_available = collection is not None
-    kb_available = kb_jsonl_ready()
     logger.info(
-        "retrieval_resources chroma_collection_available=%s kb_jsonl_found=%s",
-        chroma_available,
-        kb_available,
+        "retrieval_strict chroma_collection_available=%s",
+        collection is not None,
     )
-    if not chroma_available and not kb_available:
-        logger.error(
-            "retrieval_aborted_no_backend chroma=%s kb_jsonl=%s",
-            chroma_available,
-            kb_available,
+    t0 = time.perf_counter()
+    if collection is None:
+        logger.warning(
+            "retrieval_collection_unavailable skip_keyword_jsonl query_preview=%s",
+            (retrieval_query or "")[:120],
         )
-        raise RetrievalInfrastructureError(
-            "知识库未就绪：未检测到可用的向量库（db/chroma），且未找到 data/kb_chunks.jsonl。"
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "retrieval_end backend=collection_unavailable count=0 latency_ms=%s",
+            latency_ms,
         )
+        return [], latency_ms, "collection_unavailable"
 
     logger.info("retrieval_start query_preview=%s", (retrieval_query or "")[:120])
-    t0 = time.perf_counter()
-    if collection is not None:
+    try:
         chunks = retrieve_context(
             collection=collection,
             question=retrieval_query,
@@ -758,19 +820,18 @@ def retrieve_chunks_resilient(
             embedding_model=args.embedding_model,
             top_k=args.top_k,
         )
-        backend_selected = "chroma"
-        logger.info(
-            "retrieval_final_backend=chroma hit_count=%s (no_keyword_fallback_when_chroma_loaded)",
-            len(chunks),
+    except EmbeddingRuntimeError:
+        logger.exception(
+            "retrieval_chroma_query_failed embedding_provider=%s model=%s query_preview=%s",
+            args.embedding_provider,
+            args.embedding_model,
+            (retrieval_query or "")[:120],
         )
-    else:
-        chunks = keyword_retrieve_fallback(retrieval_query, top_k=args.top_k)
-        backend_selected = "keyword_jsonl"
-        logger.info("retrieval_final_backend=keyword_jsonl hit_count=%s", len(chunks))
+        raise
+    backend_selected = "chroma"
     latency_ms = int((time.perf_counter() - t0) * 1000)
     logger.info(
-        "retrieval_end backend=%s count=%s latency_ms=%s",
-        backend_selected,
+        "retrieval_end backend=chroma hit_count=%s latency_ms=%s",
         len(chunks),
         latency_ms,
     )
@@ -781,20 +842,31 @@ def generate_minimal_rag_answer(
     question: str,
     chunks: list[dict[str, object]],
     args: argparse.Namespace,
+    output_language: str = "zh",
 ) -> dict[str, object]:
     """Single OpenAI call grounded on retrieved chunks (no planner / control / rewrite)."""
     runtime_config = args.runtime_config
     surface = runtime_config.surface
     gen_started = time.perf_counter()
-    logger.info("generation_start mode=minimal_rag chunks=%s", len(chunks))
+    logger.info("generation_start mode=minimal_rag chunks=%s output_language=%s", len(chunks), output_language)
     try:
         if not chunks:
-            system = (
-                "你是管理实践与组织协作方向的助手。"
-                "当前检索未命中任何知识库片段。请明确说明：未检索到相关片段；"
-                "然后给出不超过三句的通用建议，不要编造具体文档或事实。"
-            )
-            user_text = f"用户问题：\n{question}"
+            if output_language == "en":
+                system = (
+                    "You are an assistant on management practice and cross-team collaboration. "
+                    "No knowledge-base passages were retrieved. Say clearly that nothing was retrieved; "
+                    "then give at most three sentences of general guidance without inventing document-specific facts.\n"
+                    + ENGLISH_ANSWER_GUIDANCE
+                )
+                user_text = f"User question:\n{question}"
+            else:
+                system = (
+                    "你是管理实践与组织协作方向的助手。"
+                    "当前检索未命中任何知识库片段。请明确说明：未检索到相关片段；"
+                    "然后给出不超过三句的通用建议，不要编造具体文档或事实。"
+                    + ZH_MINIMAL_TAIL
+                )
+                user_text = f"用户问题：\n{question}"
             answer, _usage, retry_count = request_llm_answer(system, user_text, surface, 0.35)
             prompt_combined = f"{system}\n\n{user_text}"
         else:
@@ -803,16 +875,31 @@ def generate_minimal_rag_answer(
                 char_limit=args.context_char_limit,
             )
             source_text = format_sources(used_chunks)
-            system = (
-                "你是RAG问答助手。必须严格依据下方「检索片段」回答，不得编造片段中不存在的事实。"
-                "若片段不足以回答，请说明依据不足，并引用片段中能支持的部分。"
-                "回答末尾用「来源：」列出片段来源。"
-            )
-            user_text = (
-                f"问题：\n{question}\n\n"
-                f"检索片段：\n{context_text}\n\n"
-                f"可引用来源：\n{source_text}"
-            )
+            if output_language == "en":
+                system = (
+                    "You are a RAG assistant. Answer strictly from the retrieved passages below; "
+                    "do not state facts that are not supported by the passages. "
+                    "If the passages are insufficient, say so and only use what they support.\n"
+                    + ENGLISH_ANSWER_GUIDANCE
+                    + ' End with a section titled "Sources:" listing each passage as file name + chunk id.'
+                )
+                user_text = (
+                    f"Question:\n{question}\n\n"
+                    f"Retrieved passages (may include Chinese; use them for substance only):\n{context_text}\n\n"
+                    f"Citable sources:\n{source_text}"
+                )
+            else:
+                system = (
+                    "你是RAG问答助手。必须严格依据下方「检索片段」回答，不得编造片段中不存在的事实。"
+                    "若片段不足以回答，请说明依据不足，并引用片段中能支持的部分。"
+                    "回答末尾用「来源：」列出片段来源。"
+                    + ZH_MINIMAL_TAIL
+                )
+                user_text = (
+                    f"问题：\n{question}\n\n"
+                    f"检索片段：\n{context_text}\n\n"
+                    f"可引用来源：\n{source_text}"
+                )
             answer, _usage, retry_count = request_llm_answer(system, user_text, surface, 0.35)
             prompt_combined = f"{system}\n\n{user_text}"
     except SurfaceGenerationRuntimeError as exc:
@@ -832,6 +919,7 @@ def generate_minimal_rag_answer(
         "query_type": "minimal_rag",
         "fallback_triggered": False,
         "rewrite_triggered": False,
+        "output_language": output_language,
     }
     return {
         "answer": answer,
@@ -852,6 +940,7 @@ def generate_minimal_rag_answer(
             "runtime_path": "minimal_rag_openai",
             "runtime_profile": runtime_config.metadata.profile_name,
             "selected_from": "minimal_rag_openai",
+            "output_language": output_language,
         },
     }
 
@@ -861,6 +950,7 @@ def generate_answer_v3_runtime(
     chunks: list[dict[str, object]],
     args: argparse.Namespace,
     diagnosis_result: dict[str, object] | None = None,
+    output_language: str = "zh",
 ) -> dict[str, object]:
     if args.no_rag:
         raise ValueError("The v3 runtime requires retrieval results and does not support --no-rag.")
@@ -875,6 +965,7 @@ def generate_answer_v3_runtime(
         diagnosis_result=diagnosis_result,
         surface_config=runtime_config.surface,
     )
+    planner_context["output_language"] = output_language
     planner_latency_ms = int((time.perf_counter() - planner_started) * 1000)
     context_length = sum(len(str(chunk["document"])) for chunk in chunks)
 
@@ -886,6 +977,7 @@ def generate_answer_v3_runtime(
             config=runtime_config.surface,
             diagnosis_result=dict(planner_context.get("question_diagnosis") or {}),
             planner_meta=dict(planner_context.get("planner_output_v2") or {}),
+            output_language=output_language,
         )
         selection_result = select_answer(planner_context, llm_result, runtime_config)
     except (SurfaceGenerationConfigError, SurfaceGenerationRuntimeError) as exc:
@@ -968,6 +1060,7 @@ def answer_single_turn_payload(
     collection: Any | None,
     question: str,
     args: argparse.Namespace,
+    chroma_load_reason: str | None = None,
 ) -> dict[str, object]:
     runtime_config = args.runtime_config
     flags = runtime_config.feature_flags
@@ -984,6 +1077,7 @@ def answer_single_turn_payload(
         content=question,
         turn_index=turn_index,
     )
+    output_language = infer_output_language(question)
 
     retrieval_started = time.perf_counter()
     chunks: list[dict[str, object]] = []
@@ -1038,6 +1132,7 @@ def answer_single_turn_payload(
                     "rewrite": 0,
                     "total": int((time.perf_counter() - request_started) * 1000),
                 },
+                "output_language": output_language,
             }
         )
         generation_trace = _build_generation_trace(
@@ -1065,6 +1160,9 @@ def answer_single_turn_payload(
             "retrieval_count": 0,
             "retrieval_latency_ms": 0,
             "retrieval_backend": None,
+            "retrieval_status": None,
+            "retrieval_reason": None,
+            "output_language": output_language,
             "debug_info": debug_info,
             "selected_from": "clarification",
             "fallback_triggered": False,
@@ -1082,6 +1180,7 @@ def answer_single_turn_payload(
             retrieval_query,
             args,
         )
+        chunks = filter_chunks_for_user_facing(chunks)
 
     if not args.no_rag:
         context_length = sum(len(str(chunk["document"])) for chunk in chunks)
@@ -1096,6 +1195,197 @@ def answer_single_turn_payload(
             rerank_applied=True,
         )
 
+    if not args.no_rag and len(chunks) == 0:
+        rs, rb, rr = build_retrieval_fields(
+            no_rag=args.no_rag,
+            collection=collection,
+            chroma_load_reason=chroma_load_reason,
+            retrieval_backend=retrieval_backend,
+            chunk_count=0,
+        )
+        if rs == "collection_unavailable":
+            add_generation_log(
+                session_id=session_id,
+                message_id=user_message_id,
+                provider="system",
+                model_name="kb_scope_gate",
+                prompt_text=json.dumps(
+                    {"question": question, "rejection_reason": "collection_unavailable"},
+                    ensure_ascii=False,
+                ),
+                prompt_length=len(question),
+                answer=COLLECTION_UNAVAILABLE_MESSAGE,
+                latency_ms=0,
+                retry_count=0,
+                success=True,
+                error_message=None,
+                metadata_json={
+                    "runtime_path": "collection_unavailable_rejection",
+                    "runtime_profile": runtime_config.metadata.profile_name,
+                    "request_id": request_id,
+                    "rejection_reason": "collection_unavailable",
+                },
+            )
+            assistant_message_id = add_message(
+                session_id=session_id,
+                role="assistant",
+                content=COLLECTION_UNAVAILABLE_MESSAGE,
+                turn_index=turn_index + 1,
+            )
+            debug_info_cu: dict[str, object] = {
+                "request_id": request_id,
+                "session_id": session_id,
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "query": question,
+                "retrieval_query": retrieval_query,
+                "reasoning_rewrite": list((diagnosis_result or {}).get("rewrite_for_reasoning", [])),
+                "question_diagnosis": diagnosis_result,
+                "generation_chain_v2_enabled": use_full_chain,
+                "minimal_rag_mode": use_minimal_rag,
+                "retrieval_backend": rb,
+                "retrieval_count": 0,
+                "retrieval_latency_ms": retrieval_latency_ms,
+                "retrieval_status": rs,
+                "retrieval_reason": rr,
+                "rejection_reason": "collection_unavailable",
+                "output_language": output_language,
+                "timings_ms": {
+                    "retrieval": retrieval_latency_ms,
+                    "planner": 0,
+                    "generation": 0,
+                    "rewrite": 0,
+                    "total": int((time.perf_counter() - request_started) * 1000),
+                },
+            }
+            generation_trace = _build_generation_trace(
+                question=question,
+                diagnosis_result=diagnosis_result,
+                retrieval_rewrites=retrieval_rewrites,
+                retrieval_query=retrieval_query,
+                chunks=[],
+                planner_result=None,
+                debug_payload=debug_info_cu,
+                log_metadata=None,
+                final_answer=COLLECTION_UNAVAILABLE_MESSAGE,
+                failure_logged=False,
+                failure_type=None,
+                rejection_reason="collection_unavailable",
+            )
+            return {
+                "request_id": request_id,
+                "session_id": session_id,
+                "question": question,
+                "answer": COLLECTION_UNAVAILABLE_MESSAGE,
+                "sources": [],
+                "source_text": "",
+                "retrieved_chunks": [],
+                "retrieval_query": retrieval_query,
+                "retrieval_count": 0,
+                "retrieval_latency_ms": retrieval_latency_ms,
+                "retrieval_backend": rb,
+                "retrieval_status": rs,
+                "retrieval_reason": rr,
+                "output_language": output_language,
+                "debug_info": debug_info_cu,
+                "selected_from": "collection_unavailable",
+                "fallback_triggered": False,
+                "needs_clarification": False,
+                "clarification_question": None,
+                "generation_trace": generation_trace,
+            }
+
+        add_generation_log(
+            session_id=session_id,
+            message_id=user_message_id,
+            provider="system",
+            model_name="kb_scope_gate",
+            prompt_text=json.dumps(
+                {"question": question, "rejection_reason": "out_of_scope"},
+                ensure_ascii=False,
+            ),
+            prompt_length=len(question),
+            answer=OUT_OF_SCOPE_REJECTION_MESSAGE,
+            latency_ms=0,
+            retry_count=0,
+            success=True,
+            error_message=None,
+            metadata_json={
+                "runtime_path": "out_of_scope_rejection",
+                "runtime_profile": runtime_config.metadata.profile_name,
+                "request_id": request_id,
+                "rejection_reason": "out_of_scope",
+            },
+        )
+        assistant_message_id = add_message(
+            session_id=session_id,
+            role="assistant",
+            content=OUT_OF_SCOPE_REJECTION_MESSAGE,
+            turn_index=turn_index + 1,
+        )
+        debug_info: dict[str, object] = {
+            "request_id": request_id,
+            "session_id": session_id,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "query": question,
+            "retrieval_query": retrieval_query,
+            "reasoning_rewrite": list((diagnosis_result or {}).get("rewrite_for_reasoning", [])),
+            "question_diagnosis": diagnosis_result,
+            "generation_chain_v2_enabled": use_full_chain,
+            "minimal_rag_mode": use_minimal_rag,
+            "retrieval_backend": rb,
+            "retrieval_count": 0,
+            "retrieval_latency_ms": retrieval_latency_ms,
+            "retrieval_status": rs,
+            "retrieval_reason": rr,
+            "rejection_reason": "out_of_scope",
+            "output_language": output_language,
+            "timings_ms": {
+                "retrieval": retrieval_latency_ms,
+                "planner": 0,
+                "generation": 0,
+                "rewrite": 0,
+                "total": int((time.perf_counter() - request_started) * 1000),
+            },
+        }
+        generation_trace = _build_generation_trace(
+            question=question,
+            diagnosis_result=diagnosis_result,
+            retrieval_rewrites=retrieval_rewrites,
+            retrieval_query=retrieval_query,
+            chunks=[],
+            planner_result=None,
+            debug_payload=debug_info,
+            log_metadata=None,
+            final_answer=OUT_OF_SCOPE_REJECTION_MESSAGE,
+            failure_logged=False,
+            failure_type=None,
+            rejection_reason="out_of_scope",
+        )
+        return {
+            "request_id": request_id,
+            "session_id": session_id,
+            "question": question,
+            "answer": OUT_OF_SCOPE_REJECTION_MESSAGE,
+            "sources": [],
+            "source_text": "",
+            "retrieved_chunks": [],
+            "retrieval_query": retrieval_query,
+            "retrieval_count": 0,
+            "retrieval_latency_ms": retrieval_latency_ms,
+            "retrieval_backend": rb,
+            "retrieval_status": rs,
+            "retrieval_reason": rr,
+            "output_language": output_language,
+            "debug_info": debug_info,
+            "selected_from": "out_of_scope",
+            "fallback_triggered": False,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "generation_trace": generation_trace,
+        }
+
     try:
         if use_full_chain:
             generation_result = generate_answer_v3_runtime(
@@ -1103,12 +1393,14 @@ def answer_single_turn_payload(
                 chunks=chunks,
                 args=args,
                 diagnosis_result=diagnosis_result,
+                output_language=output_language,
             )
         elif use_minimal_rag:
             generation_result = generate_minimal_rag_answer(
                 question=question,
                 chunks=chunks,
                 args=args,
+                output_language=output_language,
             )
         else:
             generation_result = generate_answer(
@@ -1122,6 +1414,7 @@ def answer_single_turn_payload(
                 no_rag=args.no_rag,
                 context_char_limit=args.context_char_limit,
                 debug=args.debug,
+                output_language=output_language,
             )
     except LLMRuntimeError as exc:
         add_generation_log(
@@ -1241,8 +1534,19 @@ def answer_single_turn_payload(
                 "rewrite": rewrite_latency_ms,
                 "total": total_latency_ms,
             },
+            "output_language": output_language,
         }
     )
+    debug_info["output_language"] = output_language
+    retr_status, retr_backend, retr_reason = build_retrieval_fields(
+        no_rag=args.no_rag,
+        collection=collection,
+        chroma_load_reason=chroma_load_reason,
+        retrieval_backend=retrieval_backend,
+        chunk_count=len(chunks),
+    )
+    debug_info["retrieval_status"] = retr_status
+    debug_info["retrieval_reason"] = retr_reason
     generation_trace = _build_generation_trace(
         question=question,
         diagnosis_result=diagnosis_result,
@@ -1269,7 +1573,10 @@ def answer_single_turn_payload(
         "retrieval_query": retrieval_query,
         "retrieval_count": len(chunks),
         "retrieval_latency_ms": retrieval_latency_ms,
-        "retrieval_backend": retrieval_backend,
+        "retrieval_backend": retr_backend,
+        "retrieval_status": retr_status,
+        "retrieval_reason": retr_reason,
+        "output_language": output_language,
         "debug_info": debug_info,
         "selected_from": debug_info.get("selected_from"),
         "fallback_triggered": bool(debug_info.get("fallback_triggered", False)),
@@ -1290,10 +1597,14 @@ def generate_answer(
     no_rag: bool,
     context_char_limit: int,
     debug: bool,
+    output_language: str = "zh",
 ) -> dict[str, object]:
     request_started = time.perf_counter()
     if no_rag:
-        prompt = question
+        if output_language == "en":
+            prompt = ENGLISH_ANSWER_GUIDANCE + "\n\nUser question:\n" + question
+        else:
+            prompt = question
         original_context_length = 0
         final_context_length = 0
         used_chunks: list[dict[str, object]] = []
@@ -1304,22 +1615,34 @@ def generate_answer(
         )
         source_text = format_sources(used_chunks)
 
-        system_prompt = (
-            "你是一个RAG问答助手。"
-            "你必须优先依据提供的检索片段回答，不要脱离上下文编造事实。"
-            "回答必须严格分成三部分：\n"
-            "第一部分：直接回答问题\n"
-            "第二部分：补充解释\n"
-            "第三部分：来源\n"
-            "来源格式必须是：\n"
-            "来源：\n"
-            "- 文件名 + chunk_id"
-        )
-        user_prompt = (
-            f"问题：\n{question}\n\n"
-            f"可用检索片段：\n{context_text}\n\n"
-            f"请基于以上片段回答。可引用的来源如下：\n{source_text}"
-        )
+        if output_language == "en":
+            system_prompt = (
+                "You are a RAG assistant. Answer using the retrieved passages; do not invent facts.\n"
+                "Structure: (1) direct answer (2) supporting explanation (3) Sources: with file name + chunk id.\n"
+                + ENGLISH_ANSWER_GUIDANCE
+            )
+            user_prompt = (
+                f"Question:\n{question}\n\n"
+                f"Passages:\n{context_text}\n\n"
+                f"Sources you may cite:\n{source_text}"
+            )
+        else:
+            system_prompt = (
+                "你是一个RAG问答助手。"
+                "你必须优先依据提供的检索片段回答，不要脱离上下文编造事实。"
+                "回答必须严格分成三部分：\n"
+                "第一部分：直接回答问题\n"
+                "第二部分：补充解释\n"
+                "第三部分：来源\n"
+                "来源格式必须是：\n"
+                "来源：\n"
+                "- 文件名 + chunk_id"
+            )
+            user_prompt = (
+                f"问题：\n{question}\n\n"
+                f"可用检索片段：\n{context_text}\n\n"
+                f"请基于以上片段回答。可引用的来源如下：\n{source_text}"
+            )
         prompt = f"{system_prompt}\n\n{user_prompt}"
 
     if debug:
@@ -1456,6 +1779,8 @@ def generate_answer(
         "context_length": final_context_length,
         "retry_count": attempt - 1,
         "latency_ms": int((time.perf_counter() - request_started) * 1000),
+        "debug_payload": {"output_language": output_language, "selected_from": "legacy_ollama"},
+        "log_metadata": {"output_language": output_language},
     }
 
 
@@ -1463,9 +1788,15 @@ def run_single_turn(
     collection: Any | None,
     question: str,
     args: argparse.Namespace,
+    chroma_load_reason: str | None = None,
 ) -> str:
     runtime_config = args.runtime_config
-    payload = answer_single_turn_payload(collection=collection, question=question, args=args)
+    payload = answer_single_turn_payload(
+        collection=collection,
+        question=question,
+        args=args,
+        chroma_load_reason=chroma_load_reason,
+    )
     session_id = str(payload["session_id"])
     answer = str(payload["answer"])
     sources = str(payload["source_text"])
@@ -1496,12 +1827,11 @@ def run() -> None:
             "Please run `python init_db.py` first."
         )
 
-    collection: Any | None = None
-    if not args.no_rag:
-        collection = load_collection_from_args(args)
+    collection, chroma_load_reason = load_collection_from_args(args)
     if collection is None and not args.no_rag:
         print(
-            "Warning: Chroma is missing or unavailable; continuing without vector retrieval.",
+            "Warning: Chroma is missing or unavailable "
+            f"(reason={chroma_load_reason!r}); continuing without vector retrieval.",
             file=sys.stderr,
         )
         args = argparse.Namespace(**vars(args))
@@ -1514,7 +1844,7 @@ def run() -> None:
         print(f"[debug] cli_overrides={json.dumps(args.runtime_config.metadata.cli_overrides, ensure_ascii=False)}")
 
     if args.question:
-        args.session_id = run_single_turn(collection, args.question, args)
+        args.session_id = run_single_turn(collection, args.question, args, chroma_load_reason)
         return
 
     print("Interactive mode. Type 'exit' or 'quit' to stop.\n")
@@ -1526,7 +1856,7 @@ def run() -> None:
         if not question:
             continue
 
-        args.session_id = run_single_turn(collection, question, args)
+        args.session_id = run_single_turn(collection, question, args, chroma_load_reason)
         print()
 
 

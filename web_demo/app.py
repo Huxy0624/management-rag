@@ -15,6 +15,7 @@ from web_demo.feedback_store import save_feedback
 from embedding_provider import EmbeddingRuntimeError
 
 from chat import RetrievalInfrastructureError, chroma_installation_status, retrieve_chunks_resilient
+from runtime.kb_source_policy import filter_chunks_for_user_facing
 from web_demo.schemas import (
     AdminRequestsResponse,
     AskRequest,
@@ -25,7 +26,7 @@ from web_demo.schemas import (
     HealthResponse,
     RetrievalDiagResponse,
 )
-from web_demo.service import ask_question, get_base_args, get_collection
+from web_demo.service import ask_question, get_base_args, get_chroma_collection_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -139,7 +140,10 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
         log.error("ask_embedding_retrieval_failed: %s", exc)
         raise HTTPException(
             status_code=503,
-            detail="向量检索失败：Chroma 索引的嵌入与当前查询嵌入可能不一致，请重建索引或检查 embedding 配置。",
+            detail=(
+                "向量检索失败：Chroma 索引与当前查询的 embedding 不一致，请用 OpenAI embedding 重建 db/chroma 或对齐配置。"
+                f" 详情: {exc}"
+            ),
         ) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -156,6 +160,9 @@ def ask(payload: AskRequest, request: Request) -> AskResponse:
             "retrieval_count": result.get("retrieval_count"),
             "retrieval_latency_ms": result.get("retrieval_latency_ms"),
             "retrieval_backend": result.get("retrieval_backend"),
+            "retrieval_status": result.get("retrieval_status"),
+            "retrieval_reason": result.get("retrieval_reason"),
+            "output_language": result.get("output_language"),
         }
     return AskResponse(**result)
 
@@ -169,7 +176,7 @@ def diag_chroma() -> dict[str, object]:
 
 @app.get("/api/diag/retrieval", response_model=RetrievalDiagResponse)
 def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
-    """Run retrieval only (Chroma + OpenAI embed, or keyword JSONL fallback) for smoke tests."""
+    """Run retrieval only (strict Chroma when collection is open; empty if unavailable)."""
     _enforce_rate_limit(request)
     args = get_base_args()
     if args.no_rag:
@@ -177,9 +184,10 @@ def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
     query = (q or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter q is required.")
-    collection = get_collection()
+    collection, chroma_unavailable_reason = get_chroma_collection_state()
     try:
         chunks, latency_ms, backend = retrieve_chunks_resilient(collection, query, args)
+        chunks = filter_chunks_for_user_facing(chunks)
     except RetrievalInfrastructureError as exc:
         log.error("diag_retrieval_infrastructure: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -187,7 +195,10 @@ def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
         log.error("diag_retrieval_embedding_failed: %s", exc)
         raise HTTPException(
             status_code=503,
-            detail="向量检索失败：索引嵌入与当前查询嵌入可能不一致，需用相同 embedding 方案重建 Chroma。",
+            detail=(
+                "向量检索失败：索引与当前查询的 embedding 方案或维度不一致，需用与线上一致的 OpenAI embedding 重建 Chroma。"
+                f" 详情: {exc}"
+            ),
         ) from exc
     preview = [
         {
@@ -199,12 +210,13 @@ def diag_retrieval(q: str, request: Request) -> RetrievalDiagResponse:
         for c in chunks[:10]
     ]
     return RetrievalDiagResponse(
-        ok=True,
+        ok=collection is not None,
         retrieval_query=query,
         chunk_count=len(chunks),
         latency_ms=latency_ms,
         backend=backend,
         chunks=preview,
+        chroma_unavailable_reason=chroma_unavailable_reason if collection is None else None,
     )
 
 

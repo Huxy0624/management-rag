@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from runtime.llm_surface_runtime import load_prompt, request_llm_answer
+from runtime.output_language import answer_language_suffix
 from runtime.runtime_config import SurfaceRuntimeConfig
 
 
@@ -22,6 +23,7 @@ def build_rewrite_payload(row: dict[str, Any], current_answer: str, control_chec
     return {
         "query": row["query"],
         "query_type": row["query_type"],
+        "output_language": row.get("output_language", "zh"),
         "question_diagnosis": row.get("question_diagnosis"),
         "planner_meta": row.get("planner_output_v2"),
         "planner_output": row["planner_output_v21"],
@@ -33,7 +35,11 @@ def build_rewrite_payload(row: dict[str, Any], current_answer: str, control_chec
 def rewrite_answer(row: dict[str, Any], current_answer: str, control_checks: dict[str, Any], config: SurfaceRuntimeConfig) -> dict[str, Any]:
     prompt_text = load_prompt(config.rewrite_prompt_path)
     payload = build_rewrite_payload(row, current_answer, control_checks)
-    user_text = "请根据以下 JSON 做最后一轮受控改写，只输出改写后的答案正文。\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    user_text = (
+        "请根据以下 JSON 做最后一轮受控改写，只输出改写后的答案正文。\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + answer_language_suffix(str(row.get("output_language", "zh")))
+    )
     started = time.perf_counter()
     answer, usage, retry_count = request_llm_answer(prompt_text, user_text, config=config, temperature=0.0)
     return {

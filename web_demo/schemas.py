@@ -25,6 +25,9 @@ class AskResponse(BaseModel):
     retrieval_count: int = 0
     retrieval_latency_ms: int = 0
     retrieval_backend: str | None = None
+    retrieval_status: str | None = None
+    retrieval_reason: str | None = None
+    output_language: str = "zh"
     selected_from: str | None = None
     fallback_triggered: bool = False
     needs_clarification: bool = False
@@ -38,6 +41,7 @@ class RetrievalDiagResponse(BaseModel):
     latency_ms: int
     backend: str
     chunks: list[dict[str, Any]]
+    chroma_unavailable_reason: str | None = None
 
 
 class HealthResponse(BaseModel):

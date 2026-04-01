@@ -192,6 +192,9 @@ function renderResponse(data) {
     ["retrieval_count", String(data.retrieval_count ?? "-")],
     ["retrieval_latency_ms", String(data.retrieval_latency_ms ?? debug.timings_ms?.retrieval ?? "-")],
     ["retrieval_backend", data.retrieval_backend || debug.retrieval_backend || "-"],
+    ["retrieval_status", data.retrieval_status ?? debug.retrieval_status ?? "-"],
+    ["retrieval_reason", data.retrieval_reason ?? debug.retrieval_reason ?? "-"],
+    ["output_language", data.output_language ?? debug.output_language ?? "-"],
     ["planning_query", debug.planning_query || "-"]
   ]);
 

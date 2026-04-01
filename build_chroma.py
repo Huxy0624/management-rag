@@ -260,7 +260,7 @@ def parse_args() -> argparse.Namespace:
         "--embedding-provider",
         default=DEFAULT_EMBEDDING_PROVIDER,
         choices=["local", "openai"],
-        help="Embedding provider. Default is local.",
+        help=f"Embedding provider (default: {DEFAULT_EMBEDDING_PROVIDER}, matches runtime in embedding_provider.py).",
     )
     parser.add_argument(
         "--embedding-model",
